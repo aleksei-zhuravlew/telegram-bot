@@ -14,16 +14,15 @@ def home():
 @app.post(f"/{BOT_TOKEN}")
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
-    print("UPDATE:", update)
 
     if "channel_post" in update:
         post = update["channel_post"]
-        print("CHANNEL POST FOUND")
 
         text = post.get("text") or post.get("caption") or ""
         message_id = post.get("message_id")
         channel = (post.get("chat") or {}).get("username", "")
         date_value = post.get("date")
+        media_group_id = post.get("media_group_id", "")
 
         link = f"https://t.me/{channel}/{message_id}" if channel else ""
 
@@ -31,17 +30,15 @@ def telegram_webhook():
             "title": text,
             "channel": channel,
             "date": str(date_value),
-            "link": link
+            "link": link,
+            "media_group_id": str(media_group_id),
+            "message_id": str(message_id)
         }
 
-        print("SENDING TO SHEETS:", data)
-
         try:
-            resp = requests.post(WEBHOOK_URL, json=data, timeout=20)
-            print("SHEETS STATUS:", resp.status_code)
-            print("SHEETS RESPONSE:", resp.text)
+            requests.post(WEBHOOK_URL, json=data, timeout=20)
         except Exception as e:
-            print("SHEETS ERROR:", str(e))
+            print("SHEETS ERROR:", str(e), flush=True)
 
     return "ok", 200
 
