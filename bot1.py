@@ -93,12 +93,9 @@ def tg_download_file(file_id: str) -> str:
     resp = requests.get(file_url, timeout=DOWNLOAD_TIMEOUT)
     resp.raise_for_status()
 
-    suffix = ""
-    guessed_ext = mimetypes.guess_extension(
-        (resp.headers.get("Content-Type", "").split(";")[0].strip() or "")
-    )
-    if guessed_ext:
-        suffix = guessed_ext
+    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+    guessed_ext = mimetypes.guess_extension(content_type) if content_type else None
+    suffix = guessed_ext or ""
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(resp.content)
@@ -130,11 +127,15 @@ def vk_upload_wall_photo(file_path: str, group_id: str, token: str) -> str:
     with open(file_path, "rb") as photo_file:
         upload_resp = requests.post(
             upload_server["upload_url"],
-            files={"photo": photo_file},
+            files={"photo": (os.path.basename(file_path), photo_file)},
             timeout=UPLOAD_TIMEOUT
         )
+
     upload_resp.raise_for_status()
     uploaded = upload_resp.json()
+
+    if not all(k in uploaded for k in ("photo", "server", "hash")):
+        raise RuntimeError(f"VK upload bad response: {uploaded}")
 
     saved = vk_api("photos.saveWallPhoto", {
         "group_id": group_id,
@@ -156,6 +157,7 @@ def vk_post_to_wall(text: str, attachments: Optional[List[str]], group_id: str, 
         "from_group": 1,
         "message": text,
     }
+
     if attachments:
         params["attachments"] = ",".join(attachments)
 
@@ -198,11 +200,22 @@ def extract_caption_or_text(post: dict) -> str:
     return (post.get("text") or post.get("caption") or "").strip()
 
 
-def extract_best_photo_file_id(post: dict) -> Optional[str]:
+def extract_image_file_id(post: dict) -> Optional[str]:
     photos = post.get("photo") or []
-    if not photos:
-        return None
-    return photos[-1].get("file_id")
+    if photos:
+        return photos[-1].get("file_id")
+
+    doc = post.get("document") or {}
+    mime_type = (doc.get("mime_type") or "").lower()
+    file_name = (doc.get("file_name") or "").lower()
+
+    if mime_type.startswith("image/"):
+        return doc.get("file_id")
+
+    if file_name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return doc.get("file_id")
+
+    return None
 
 
 def append_source_link(text: str, link: str) -> str:
@@ -211,6 +224,23 @@ def append_source_link(text: str, link: str) -> str:
     if not text:
         return link
     return f"{text}\n\nИсточник: {link}"
+
+
+def debug_post_media(post: dict):
+    print(
+        "MEDIA DEBUG:",
+        {
+            "message_id": post.get("message_id"),
+            "has_photo": bool(post.get("photo")),
+            "has_document": bool(post.get("document")),
+            "document_mime": (post.get("document") or {}).get("mime_type"),
+            "document_name": (post.get("document") or {}).get("file_name"),
+            "has_video": bool(post.get("video")),
+            "has_animation": bool(post.get("animation")),
+            "media_group_id": post.get("media_group_id"),
+        },
+        flush=True
+    )
 
 
 def publish_single_post_to_vk(post: dict):
@@ -237,21 +267,27 @@ def publish_single_post_to_vk(post: dict):
     link = build_link(post)
     final_text = append_source_link(text, link)
 
-    photo_file_id = extract_best_photo_file_id(post)
+    image_file_id = extract_image_file_id(post)
 
     temp_files = []
     try:
         attachments = []
 
-        if photo_file_id:
-            local_path = tg_download_file(photo_file_id)
+        if image_file_id:
+            local_path = tg_download_file(image_file_id)
             temp_files.append(local_path)
             attachments.append(vk_upload_wall_photo(local_path, group_id, token))
 
-        vk_result = vk_post_to_wall(final_text, attachments=attachments, group_id=group_id, token=token)
-        processed_single_messages[message_id] = now_ts()
+        vk_result = vk_post_to_wall(
+            final_text,
+            attachments=attachments,
+            group_id=group_id,
+            token=token
+        )
 
+        processed_single_messages[message_id] = now_ts()
         print(f"VK OK single message_id={message_id}, result={vk_result}", flush=True)
+
     finally:
         for path in temp_files:
             try:
@@ -298,11 +334,11 @@ def publish_album_to_vk(media_group_id: str, items: List[dict]):
         attachments = []
 
         for item in items_sorted:
-            photo_file_id = extract_best_photo_file_id(item)
-            if not photo_file_id:
+            image_file_id = extract_image_file_id(item)
+            if not image_file_id:
                 continue
 
-            local_path = tg_download_file(photo_file_id)
+            local_path = tg_download_file(image_file_id)
             temp_files.append(local_path)
 
             vk_attachment = vk_upload_wall_photo(local_path, group_id, token)
@@ -318,6 +354,7 @@ def publish_album_to_vk(media_group_id: str, items: List[dict]):
 
         processed_media_groups[media_group_id] = now_ts()
         print(f"VK OK album media_group_id={media_group_id}, result={vk_result}", flush=True)
+
     finally:
         for path in temp_files:
             try:
@@ -377,6 +414,8 @@ def telegram_webhook():
 
     if "channel_post" in update:
         post = update["channel_post"]
+
+        debug_post_media(post)
 
         try:
             send_to_sheets(post)
