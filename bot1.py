@@ -10,7 +10,7 @@ from flask import Flask, request
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # Apps Script URL
-PORT = int(os.environ.get("PORT", 10000"))
+PORT = int(os.environ.get("PORT", "10000"))
 
 ALBUM_DELAY_SEC = float(os.environ.get("ALBUM_DELAY_SEC", "3"))
 APPEND_SOURCE_LINK = os.environ.get("APPEND_SOURCE_LINK", "1") == "1"
