@@ -55,7 +55,7 @@ def load_channel_mapping():
         resp = requests.get(
             WEBHOOK_URL,
             params={"action": "get_mapping"},
-            timeout=HTTP_TIMEOUT
+            timeout=60
         )
         resp.raise_for_status()
         data = resp.json()
@@ -108,15 +108,44 @@ def vk_api(method: str, params: dict, token: str) -> dict:
     url = f"https://api.vk.com/method/{method}"
     payload = {
         **params,
-        "access_token": token,
+        "access_token": str(token).strip(),
         "v": "5.199",
     }
-    resp = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(f"VK API error in {method}: {data['error']}")
-    return data["response"]
+
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "error" in data:
+                raise RuntimeError(f"VK API error in {method}: {data['error']}")
+
+            return data["response"]
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (502, 503, 504) and attempt < 2:
+                print(f"VK RETRY {method}: HTTP {status}, attempt={attempt + 1}", flush=True)
+                time.sleep(2 * (attempt + 1))
+                last_error = e
+                continue
+            raise
+
+        except requests.exceptions.RequestException as e:
+            if attempt < 2:
+                print(f"VK RETRY {method}: network error, attempt={attempt + 1}, error={e}", flush=True)
+                time.sleep(2 * (attempt + 1))
+                last_error = e
+                continue
+            raise
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(f"VK API failed in {method} with unknown error")
 
 
 def vk_upload_wall_photo(file_path: str, group_id: str, token: str) -> str:
@@ -183,7 +212,7 @@ def send_to_sheets(post: dict):
     }
 
     try:
-        requests.post(WEBHOOK_URL, json=data, timeout=20)
+        requests.post(WEBHOOK_URL, json=data, timeout=60)
     except Exception as e:
         print("SHEETS ERROR:", str(e), flush=True)
 
@@ -260,8 +289,13 @@ def publish_single_post_to_vk(post: dict):
         print(f"NO VK CONFIG FOR CHANNEL: {channel_username}", flush=True)
         return
 
-    group_id = vk_config["group_id"]
-    token = vk_config["token"]
+    group_id = str(vk_config["group_id"]).strip()
+    token = str(vk_config["token"]).strip()
+
+    print(
+        f"VK CONFIG DEBUG channel={channel_username}, group_id={group_id}, token_prefix={token[:12]}, token_len={len(token)}",
+        flush=True
+    )
 
     text = extract_caption_or_text(post)
     link = build_link(post)
@@ -315,8 +349,13 @@ def publish_album_to_vk(media_group_id: str, items: List[dict]):
         print(f"NO VK CONFIG FOR CHANNEL: {channel_username}", flush=True)
         return
 
-    group_id = vk_config["group_id"]
-    token = vk_config["token"]
+    group_id = str(vk_config["group_id"]).strip()
+    token = str(vk_config["token"]).strip()
+
+    print(
+        f"VK CONFIG DEBUG channel={channel_username}, group_id={group_id}, token_prefix={token[:12]}, token_len={len(token)}",
+        flush=True
+    )
 
     text = ""
     link = ""
