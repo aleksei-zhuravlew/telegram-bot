@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import mimetypes
 import tempfile
@@ -193,6 +194,17 @@ def vk_post_to_wall(text: str, attachments: Optional[List[str]], group_id: str, 
     return vk_api("wall.post", params, token)
 
 
+def extract_author(text: str) -> str:
+    if not text:
+        return ""
+
+    match = re.search(r"Автор\s*:\s*([^\n\r]+)", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+
+    return ""
+
+
 def send_to_sheets(post: dict):
     text = post.get("text") or post.get("caption") or ""
     message_id = post.get("message_id")
@@ -201,6 +213,7 @@ def send_to_sheets(post: dict):
     media_group_id = post.get("media_group_id", "")
 
     link = f"https://t.me/{channel}/{message_id}" if channel else ""
+    author = extract_author(text)
 
     data = {
         "title": text,
@@ -208,7 +221,8 @@ def send_to_sheets(post: dict):
         "date": str(date_value),
         "link": link,
         "media_group_id": str(media_group_id),
-        "message_id": str(message_id)
+        "message_id": str(message_id),
+        "author": author
     }
 
     try:
