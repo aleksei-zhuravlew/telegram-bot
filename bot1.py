@@ -198,9 +198,20 @@ def extract_author(text: str) -> str:
     if not text:
         return ""
 
-    match = re.search(r"Автор\s*:\s*([^\n\r]+)", text, flags=re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
+    patterns = [
+        r"Автор\s*[:\-–—]\s*([^\n\r|]+)",
+        r"Автор\s+([А-ЯA-ZЁ][^\n\r|]+)",
+        r"\(\s*Автор\s*[:\-–—]?\s*([^)]+)\)",
+        r"Авторство\s*[:\-–—]\s*([^\n\r|]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            author = match.group(1).strip()
+            author = re.sub(r"(Фото|Источник|©).*", "", author, flags=re.IGNORECASE).strip()
+            author = author.strip(" .,:;-–—|")
+            return author
 
     return ""
 
