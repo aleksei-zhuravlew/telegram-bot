@@ -482,7 +482,7 @@ def vk_auth():
     if not VK_APP_ID or not VK_APP_SECRET or not VK_REDIRECT_URI:
         return "VK OAuth env vars are not configured", 500
 
-    scope = "wall,photos,groups,offline"
+    scope = "wall,photos,groups"
 
     url = (
         "https://oauth.vk.com/authorize"
