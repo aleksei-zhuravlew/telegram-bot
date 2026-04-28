@@ -497,8 +497,7 @@ def vk_auth():
     return f'<a href="{url}">Получить VK user token через Render</a>', 200
 
 
-@app.get("/vk_callback")
-def vk_callback():
+def handle_vk_callback_code():
     error = request.args.get("error")
     error_description = request.args.get("error_description")
 
@@ -508,7 +507,7 @@ def vk_callback():
     code = request.args.get("code", "")
 
     if not code:
-        return "No code received from VK", 400
+        return "ok", 200
 
     try:
         resp = requests.get(
@@ -543,7 +542,7 @@ def vk_callback():
 
 @app.get("/")
 def home():
-    return "ok", 200
+    return handle_vk_callback_code()
 
 
 @app.post(f"/{BOT_TOKEN}")
