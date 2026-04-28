@@ -13,6 +13,11 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # Apps Script URL
 PORT = int(os.environ.get("PORT", "10000"))
 
+VK_APP_ID = os.environ.get("VK_APP_ID", "")
+VK_APP_SECRET = os.environ.get("VK_APP_SECRET", "")
+VK_REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "")
+VK_AUTH_SECRET = os.environ.get("VK_AUTH_SECRET", "")
+
 ALBUM_DELAY_SEC = float(os.environ.get("ALBUM_DELAY_SEC", "3"))
 APPEND_SOURCE_LINK = os.environ.get("APPEND_SOURCE_LINK", "1") == "1"
 
@@ -465,6 +470,75 @@ def buffer_album_post(post: dict):
         timer.daemon = True
         existing["timer"] = timer
         timer.start()
+
+
+@app.get("/vk_auth")
+def vk_auth():
+    secret = request.args.get("secret", "")
+
+    if not VK_AUTH_SECRET or secret != VK_AUTH_SECRET:
+        return "Forbidden", 403
+
+    if not VK_APP_ID or not VK_APP_SECRET or not VK_REDIRECT_URI:
+        return "VK OAuth env vars are not configured", 500
+
+    scope = "wall,photos,groups,offline"
+
+    url = (
+        "https://oauth.vk.com/authorize"
+        f"?client_id={VK_APP_ID}"
+        "&display=page"
+        f"&redirect_uri={VK_REDIRECT_URI}"
+        f"&scope={scope}"
+        "&response_type=code"
+        "&v=5.199"
+    )
+
+    return f'<a href="{url}">Получить VK user token через Render</a>', 200
+
+
+@app.get("/vk_callback")
+def vk_callback():
+    error = request.args.get("error")
+    error_description = request.args.get("error_description")
+
+    if error:
+        return f"VK OAuth error: {error}<br>{error_description}", 400
+
+    code = request.args.get("code", "")
+
+    if not code:
+        return "No code received from VK", 400
+
+    try:
+        resp = requests.get(
+            "https://oauth.vk.com/access_token",
+            params={
+                "client_id": VK_APP_ID,
+                "client_secret": VK_APP_SECRET,
+                "redirect_uri": VK_REDIRECT_URI,
+                "code": code,
+            },
+            timeout=60
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "access_token" not in data:
+            return f"VK token exchange failed: {data}", 400
+
+        token = data["access_token"]
+        user_id = data.get("user_id", "")
+
+        return (
+            "<h3>VK user token получен</h3>"
+            "<p>Скопируй access_token и вставь его в свой конфиг/Google Sheet вместо старого токена.</p>"
+            f"<p><b>user_id:</b> {user_id}</p>"
+            f"<textarea style='width:100%;height:220px'>{token}</textarea>"
+        ), 200
+
+    except Exception as e:
+        return f"VK callback error: {e}", 500
 
 
 @app.get("/")
