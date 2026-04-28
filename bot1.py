@@ -5,6 +5,7 @@ import mimetypes
 import tempfile
 import threading
 from typing import Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
 from flask import Flask, request
@@ -482,19 +483,26 @@ def vk_auth():
     if not VK_APP_ID or not VK_APP_SECRET or not VK_REDIRECT_URI:
         return "VK OAuth env vars are not configured", 500
 
-    scope = "wall,photos,groups"
+    params = {
+        "client_id": VK_APP_ID,
+        "display": "page",
+        "redirect_uri": VK_REDIRECT_URI,
+        "scope": "wall,photos,groups",
+        "response_type": "code",
+        "v": "5.199",
+    }
 
-    url = (
-        "https://oauth.vk.com/authorize"
-        f"?client_id={VK_APP_ID}"
-        "&display=page"
-        f"&redirect_uri={VK_REDIRECT_URI}"
-        f"&scope={scope}"
-        "&response_type=code"
-        "&v=5.199"
-    )
+    url = "https://oauth.vk.com/authorize?" + urlencode(params)
 
-    return f'<a href="{url}">Получить VK user token через Render</a>', 200
+    return (
+        '<a href="{0}">Получить VK user token через Render</a>'
+        '<br><br>'
+        '<b>VK_REDIRECT_URI сейчас:</b><br>'
+        '<code>{1}</code>'
+        '<br><br>'
+        '<b>Ссылка авторизации:</b><br>'
+        '<textarea style="width:100%;height:160px">{0}</textarea>'
+    ).format(url, VK_REDIRECT_URI), 200
 
 
 def handle_vk_callback_code():
