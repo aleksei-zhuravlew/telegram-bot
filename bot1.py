@@ -22,6 +22,17 @@ VK_AUTH_SECRET = os.environ.get("VK_AUTH_SECRET", "")
 ALBUM_DELAY_SEC = float(os.environ.get("ALBUM_DELAY_SEC", "3"))
 APPEND_SOURCE_LINK = os.environ.get("APPEND_SOURCE_LINK", "1") == "1"
 
+CHANNEL_CURATORS = {
+    "chto_music": "Павел Кофф",
+    "chto_music_podval": "Цур",
+    "chto_music_folk": "Анастасия Викто",
+    "chto_music_pop": "Daniel",
+    "chto_music_hiphop": "Цур",
+    "chto_music_rock": "Андрей Копанев",
+    "chto_music_electronica": "Баканов Дмитрий",
+    "chto_music_indie": "Вера Чистякова",
+}
+
 HTTP_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 120
 UPLOAD_TIMEOUT = 120
@@ -42,6 +53,10 @@ PROCESSED_TTL_SEC = 6 * 60 * 60
 
 def now_ts() -> float:
     return time.time()
+
+
+def normalize_channel_username(username: str) -> str:
+    return (username or "").strip().lstrip("@")
 
 
 def cleanup_processed_maps():
@@ -225,12 +240,15 @@ def extract_author(text: str) -> str:
 def send_to_sheets(post: dict):
     text = post.get("text") or post.get("caption") or ""
     message_id = post.get("message_id")
-    channel = (post.get("chat") or {}).get("username", "")
+    channel = normalize_channel_username((post.get("chat") or {}).get("username", ""))
     date_value = post.get("date")
     media_group_id = post.get("media_group_id", "")
 
     link = f"https://t.me/{channel}/{message_id}" if channel else ""
     author = extract_author(text)
+
+    if not author and channel:
+        author = CHANNEL_CURATORS.get(channel, "")
 
     data = {
         "title": text,
