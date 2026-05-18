@@ -4,6 +4,7 @@ import time
 import mimetypes
 import tempfile
 import threading
+from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -33,6 +34,21 @@ CHANNEL_CURATORS = {
     "chto_music_indie": "Вера Чистякова",
 }
 
+MONTH_NAMES_RU = [
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+]
+
 HTTP_TIMEOUT = 30
 DOWNLOAD_TIMEOUT = 120
 UPLOAD_TIMEOUT = 120
@@ -57,6 +73,17 @@ def now_ts() -> float:
 
 def normalize_channel_username(username: str) -> str:
     return (username or "").strip().lstrip("@")
+
+
+def extract_month_name(timestamp_value) -> str:
+    if not timestamp_value:
+        return ""
+
+    try:
+        dt = datetime.fromtimestamp(int(timestamp_value))
+        return MONTH_NAMES_RU[dt.month - 1]
+    except Exception:
+        return ""
 
 
 def cleanup_processed_maps():
@@ -250,6 +277,8 @@ def send_to_sheets(post: dict):
     if not author and channel:
         author = CHANNEL_CURATORS.get(channel, "")
 
+    month = extract_month_name(date_value)
+
     data = {
         "title": text,
         "channel": channel,
@@ -257,7 +286,8 @@ def send_to_sheets(post: dict):
         "link": link,
         "media_group_id": str(media_group_id),
         "message_id": str(message_id),
-        "author": author
+        "author": author,
+        "month": month
     }
 
     try:
