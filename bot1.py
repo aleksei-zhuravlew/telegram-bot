@@ -12,30 +12,6 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 import requests
 from flask import Flask, request
 
-
-# =======================
-# PROD 2.0 ROUTER CONFIG
-# =======================
-
-ALLOWED_CHAT_ID = -1003533638771
-
-THREAD_MAP = {
-    647: "rock",
-    641: "indie",
-    649: "electronica",
-    643: "pop",
-    651: "hiphop",
-    653: "underground",
-    3355: "glavred",
-}
-
-def get_thread_genre(thread_id):
-    try:
-        return THREAD_MAP.get(int(thread_id))
-    except:
-        return None
-
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # Apps Script URL
 PORT = int(os.environ.get("PORT", "10000"))
@@ -97,6 +73,7 @@ DEFAULT_THREAD_MAP = {
     643: "pop",
     653: "underground",
     651: "hiphop",
+    3355: "glavred",
 }
 
 # Optional override/extension in Render env, format:
@@ -591,6 +568,9 @@ def debug_thread_info(post: dict, source: str):
                 "chat_username": chat.get("username"),
                 "thread_id": post.get("message_thread_id"),
                 "message_id": post.get("message_id"),
+                "from_id": (post.get("from") or {}).get("id"),
+                "from_username": (post.get("from") or {}).get("username"),
+                "from_is_bot": (post.get("from") or {}).get("is_bot"),
                 "text": (post.get("text") or post.get("caption") or "")[:300],
             },
             flush=True
@@ -615,14 +595,19 @@ def is_allowed_predlozhka_chat(post: dict) -> bool:
     return chat_id_str in PREDLOZHKA_ALLOWED_CHAT_IDS
 
 
+def is_allowed_predlozhka_thread(post: dict) -> bool:
+    thread_id = get_thread_id(post)
+
+    if thread_id is None:
+        return False
+
+    try:
+        return int(thread_id) in THREAD_MAP
+    except Exception:
+        return False
+
+
 def send_predlozhka_to_sheets(post: dict):
-    # PROD 2.0 SAFETY FILTER
-    chat_id = post.get('chat_id') or (post.get('chat') or {}).get('id')
-    if chat_id is None or str(chat_id) != str(ALLOWED_CHAT_ID):
-        print("SKIP CHAT", chat_id, flush=True)
-        return
-
-
     """
     Writes supergroup/topic messages to the Predlozhka sheet.
     Disabled by default for safety until Apps Script is updated.
@@ -635,6 +620,19 @@ def send_predlozhka_to_sheets(post: dict):
             {
                 "chat_id": get_chat_id(post),
                 "allowed": sorted(PREDLOZHKA_ALLOWED_CHAT_IDS),
+                "text": get_post_text(post)[:120],
+            },
+            flush=True
+        )
+        return
+
+    if not is_allowed_predlozhka_thread(post):
+        print(
+            "PREDLOZHKA CAPTURE SKIPPED: thread_id is not allowed",
+            {
+                "chat_id": get_chat_id(post),
+                "thread_id": get_thread_id(post),
+                "allowed_threads": sorted(THREAD_MAP.keys()),
                 "text": get_post_text(post)[:120],
             },
             flush=True
@@ -1106,6 +1104,7 @@ GENRE_LABELS = {
     "pop": "Поп",
     "underground": "Андеграунд",
     "hiphop": "Хип-хоп",
+    "glavred": "Главред",
 }
 
 
@@ -1549,10 +1548,12 @@ def telegram_webhook():
 
     # Supergroup/topic messages: used for Predlozhka and collecting thread_id.
     # This does not affect the existing channel_post -> Sheets -> VK flow.
-    if "message" in update:
-        message = update["message"]
+    # We process normal and edited messages. Telegram Bot API does not send updates
+    # for messages sent by the same bot, and usually does not deliver other bots' messages.
+    incoming_message = update.get("message") or update.get("edited_message")
+    if incoming_message:
         try:
-            send_predlozhka_to_sheets(message)
+            send_predlozhka_to_sheets(incoming_message)
         except Exception as e:
             print("MESSAGE HANDLER ERROR:", str(e), flush=True)
 
