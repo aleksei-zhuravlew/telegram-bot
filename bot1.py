@@ -12,6 +12,30 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 import requests
 from flask import Flask, request
 
+
+# =======================
+# PROD 2.0 ROUTER CONFIG
+# =======================
+
+ALLOWED_CHAT_ID = -1003533638771
+
+THREAD_MAP = {
+    647: "rock",
+    641: "indie",
+    649: "electronica",
+    643: "pop",
+    651: "hiphop",
+    653: "underground",
+    3355: "glavred",
+}
+
+def get_thread_genre(thread_id):
+    try:
+        return THREAD_MAP.get(int(thread_id))
+    except:
+        return None
+
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # Apps Script URL
 PORT = int(os.environ.get("PORT", "10000"))
@@ -592,6 +616,13 @@ def is_allowed_predlozhka_chat(post: dict) -> bool:
 
 
 def send_predlozhka_to_sheets(post: dict):
+    # PROD 2.0 SAFETY FILTER
+    chat_id = post.get('chat_id') or (post.get('chat') or {}).get('id')
+    if chat_id is None or str(chat_id) != str(ALLOWED_CHAT_ID):
+        print("SKIP CHAT", chat_id, flush=True)
+        return
+
+
     """
     Writes supergroup/topic messages to the Predlozhka sheet.
     Disabled by default for safety until Apps Script is updated.
