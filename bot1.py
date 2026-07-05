@@ -1,12 +1,13 @@
 import os
 import re
+import json
 import time
 import mimetypes
 import tempfile
 import threading
 from datetime import datetime
 from typing import Dict, List, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 import requests
 from flask import Flask, request
@@ -22,6 +23,41 @@ VK_AUTH_SECRET = os.environ.get("VK_AUTH_SECRET", "")
 
 ALBUM_DELAY_SEC = float(os.environ.get("ALBUM_DELAY_SEC", "3"))
 APPEND_SOURCE_LINK = os.environ.get("APPEND_SOURCE_LINK", "1") == "1"
+
+# ======================
+# EDITORIAL CMS SAFE CONFIG
+# ======================
+# Additive configuration. Existing channel_post -> Sheets -> VK flow remains unchanged.
+PREDLOZHKA_CAPTURE_ENABLED = os.environ.get("PREDLOZHKA_CAPTURE_ENABLED", "0") == "1"
+PREDLOZHKA_SHEET_NAME = os.environ.get("PREDLOZHKA_SHEET_NAME", "Предложка")
+PUBLISHED_SHEET_NAME = os.environ.get("PUBLISHED_SHEET_NAME", "Таблица контента редакции")
+
+# Fill later after Render logs, or set in Render env as JSON:
+# {"15":"rock","39":"indie","83":"pop"}
+THREAD_MAP_JSON = os.environ.get("THREAD_MAP_JSON", "{}")
+
+try:
+    THREAD_MAP = {int(k): str(v) for k, v in json.loads(THREAD_MAP_JSON).items()}
+except Exception as e:
+    print("THREAD_MAP_JSON ERROR:", str(e), flush=True)
+    THREAD_MAP = {}
+
+COMMON_LINK_DOMAINS = (
+    "band.link",
+    "bnd.lc",
+    "lnk.to",
+    "linkfire",
+    "ffm.to",
+    "song.link",
+    "onerpm.link",
+    "hyperfollow",
+    "taplink",
+    "mssg.me",
+    "clck.ru",
+    "vk.cc",
+    "zvonko.link",
+)
+
 
 CHANNEL_CURATORS = {
     "chto_music": "Павел Кофф",
@@ -264,6 +300,278 @@ def extract_author(text: str) -> str:
     return ""
 
 
+
+# ======================
+# EDITORIAL CMS SAFE HELPERS
+# ======================
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+
+    url = str(url).strip()
+    if not url:
+        return ""
+
+    if url.startswith("www."):
+        url = "https://" + url
+
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            parsed = urlparse("https://" + url)
+
+        scheme = (parsed.scheme or "https").lower()
+        netloc = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+
+        clean_query = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            lk = key.lower()
+            if lk.startswith("utm_") or lk in (
+                "fbclid", "gclid", "yclid", "ysclid",
+                "from", "si", "feature", "ref", "ref_src",
+            ):
+                continue
+            clean_query.append((key, value))
+
+        query = "&".join(
+            f"{k}={v}" if v != "" else k
+            for k, v in clean_query
+        )
+
+        return urlunparse((scheme, netloc, path.rstrip("/"), "", query, "")).strip()
+    except Exception:
+        return url
+
+
+def is_yandex_music_link(url: str) -> bool:
+    if not url:
+        return False
+
+    try:
+        parsed = urlparse(url if "://" in url else "https://" + url)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        return "music.yandex" in host or (host == "yandex.ru" and "/music/" in path)
+    except Exception:
+        return "music.yandex" in url.lower()
+
+
+def is_common_music_link(url: str) -> bool:
+    if not url:
+        return False
+
+    low = url.lower()
+
+    if is_yandex_music_link(low):
+        return False
+
+    excluded = (
+        "t.me/",
+        "telegram.me/",
+        "vk.com/",
+        "youtube.com/",
+        "youtu.be/",
+        "instagram.com/",
+    )
+    if any(domain in low for domain in excluded):
+        return False
+
+    return any(domain in low for domain in COMMON_LINK_DOMAINS)
+
+
+def tg_entity_slice(text: str, offset: int, length: int) -> str:
+    """
+    Telegram entity offsets are UTF-16 code units.
+    This extracts visible URLs safely even if text contains emoji.
+    """
+    try:
+        raw = text.encode("utf-16-le")
+        part = raw[offset * 2:(offset + length) * 2]
+        return part.decode("utf-16-le", errors="ignore")
+    except Exception:
+        try:
+            return text[offset:offset + length]
+        except Exception:
+            return ""
+
+
+def extract_all_links_from_post(post: dict) -> List[str]:
+    text = post.get("text") or post.get("caption") or ""
+    links: List[str] = []
+
+    if text:
+        links.extend(re.findall(r"https?://[^\s<>\]\)\"']+|www\.[^\s<>\]\)\"']+", text))
+
+    for field in ("entities", "caption_entities"):
+        entities = post.get(field) or []
+        for entity in entities:
+            etype = entity.get("type")
+            if etype == "text_link":
+                url = entity.get("url")
+                if url:
+                    links.append(url)
+            elif etype == "url":
+                offset = entity.get("offset")
+                length = entity.get("length")
+                if offset is not None and length is not None:
+                    url = tg_entity_slice(text, int(offset), int(length))
+                    if url:
+                        links.append(url)
+
+    result = []
+    seen = set()
+    for link in links:
+        clean = normalize_url(link)
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+
+    return result
+
+
+def extract_music_links_from_post(post: dict):
+    yandex_links = []
+    common_links = []
+
+    for link in extract_all_links_from_post(post):
+        if is_yandex_music_link(link):
+            yandex_links.append(link)
+        elif is_common_music_link(link):
+            common_links.append(link)
+
+    return "\n".join(yandex_links), "\n".join(common_links)
+
+
+def get_post_text(post: dict) -> str:
+    return (post.get("text") or post.get("caption") or "").strip()
+
+
+def get_thread_id(post: dict):
+    return post.get("message_thread_id")
+
+
+def get_chat_id(post: dict):
+    return (post.get("chat") or {}).get("id")
+
+
+def get_genre_from_thread(thread_id) -> str:
+    if thread_id is None:
+        return ""
+
+    try:
+        return THREAD_MAP.get(int(thread_id), "")
+    except Exception:
+        return ""
+
+
+def build_message_link_any_chat(post: dict) -> str:
+    chat = post.get("chat") or {}
+    username = normalize_channel_username(chat.get("username", ""))
+    message_id = post.get("message_id")
+    chat_id = chat.get("id")
+
+    if username and message_id:
+        return f"https://t.me/{username}/{message_id}"
+
+    if chat_id and message_id:
+        chat_id_str = str(chat_id)
+        if chat_id_str.startswith("-100"):
+            internal_id = chat_id_str[4:]
+            return f"https://t.me/c/{internal_id}/{message_id}"
+
+    return ""
+
+
+def infer_post_type(text: str) -> str:
+    low = (text or "").lower()
+    if "#сверхновые" in low:
+        return "digest"
+    return "review"
+
+
+def safe_status_for_predlozhka(post_type: str, yandex_link: str, common_link: str) -> str:
+    if post_type == "digest":
+        return "pending"
+    if yandex_link or common_link:
+        return "pending"
+    return "no_link"
+
+
+def debug_thread_info(post: dict, source: str):
+    try:
+        chat = post.get("chat") or {}
+        print(
+            "🔥 THREAD DEBUG:",
+            {
+                "source": source,
+                "chat_id": chat.get("id"),
+                "chat_title": chat.get("title"),
+                "chat_username": chat.get("username"),
+                "thread_id": post.get("message_thread_id"),
+                "message_id": post.get("message_id"),
+                "text": (post.get("text") or post.get("caption") or "")[:300],
+            },
+            flush=True
+        )
+    except Exception as e:
+        print("THREAD DEBUG ERROR:", str(e), flush=True)
+
+
+def send_predlozhka_to_sheets(post: dict):
+    """
+    Writes supergroup/topic messages to the Predlozhka sheet.
+    Disabled by default for safety until Apps Script is updated.
+    """
+    debug_thread_info(post, "message")
+
+    if not PREDLOZHKA_CAPTURE_ENABLED:
+        print("PREDLOZHKA CAPTURE DISABLED: set PREDLOZHKA_CAPTURE_ENABLED=1 after Apps Script update", flush=True)
+        return
+
+    text = get_post_text(post)
+    message_id = post.get("message_id")
+    chat = post.get("chat") or {}
+    date_value = post.get("date")
+    media_group_id = post.get("media_group_id", "")
+    thread_id = get_thread_id(post)
+    chat_id = get_chat_id(post)
+    genre = get_genre_from_thread(thread_id)
+
+    yandex_link, common_link = extract_music_links_from_post(post)
+    post_type = infer_post_type(text)
+    status = safe_status_for_predlozhka(post_type, yandex_link, common_link)
+
+    author = extract_author(text)
+    month = extract_month_name(date_value)
+    link = build_message_link_any_chat(post)
+
+    data = {
+        "sheet": PREDLOZHKA_SHEET_NAME,
+        "title": text,
+        "channel": genre or str(thread_id or ""),
+        "genre": genre,
+        "date": str(date_value),
+        "link": link,
+        "media_group_id": str(media_group_id),
+        "message_id": str(message_id),
+        "chat_id": str(chat_id or ""),
+        "thread_id": str(thread_id or ""),
+        "author": author,
+        "month": month,
+        "type": post_type,
+        "status": status,
+        "yandex_link": yandex_link,
+        "common_link": common_link,
+    }
+
+    try:
+        resp = requests.post(WEBHOOK_URL, json=data, timeout=60)
+        print("PREDLOZHKA SHEETS OK:", resp.status_code, resp.text[:300], flush=True)
+    except Exception as e:
+        print("PREDLOZHKA SHEETS ERROR:", str(e), flush=True)
+
+
 def send_to_sheets(post: dict):
     text = post.get("text") or post.get("caption") or ""
     message_id = post.get("message_id")
@@ -271,7 +579,7 @@ def send_to_sheets(post: dict):
     date_value = post.get("date")
     media_group_id = post.get("media_group_id", "")
 
-    link = f"https://t.me/{channel}/{message_id}" if channel else ""
+    link = f"https://t.me/{channel}/{message_id}" if channel else build_message_link_any_chat(post)
     author = extract_author(text)
 
     if not author and channel:
@@ -279,7 +587,13 @@ def send_to_sheets(post: dict):
 
     month = extract_month_name(date_value)
 
+    thread_id = get_thread_id(post)
+    chat_id = get_chat_id(post)
+    genre = get_genre_from_thread(thread_id)
+    yandex_link, common_link = extract_music_links_from_post(post)
+
     data = {
+        # Existing fields — keep unchanged for old Apps Script
         "title": text,
         "channel": channel,
         "date": str(date_value),
@@ -287,14 +601,23 @@ def send_to_sheets(post: dict):
         "media_group_id": str(media_group_id),
         "message_id": str(message_id),
         "author": author,
-        "month": month
+        "month": month,
+
+        # New optional fields — old Apps Script safely ignores them
+        "sheet": PUBLISHED_SHEET_NAME,
+        "type": "published",
+        "status": "done",
+        "chat_id": str(chat_id or ""),
+        "thread_id": str(thread_id or ""),
+        "genre": genre,
+        "yandex_link": yandex_link,
+        "common_link": common_link,
     }
 
     try:
         requests.post(WEBHOOK_URL, json=data, timeout=60)
     except Exception as e:
         print("SHEETS ERROR:", str(e), flush=True)
-
 
 def build_link(post: dict) -> str:
     channel = (post.get("chat") or {}).get("username", "")
@@ -605,23 +928,34 @@ def home():
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
 
+    # Callback hooks for future buttons. Safe no-op for now.
+    if "callback_query" in update:
+        callback = update.get("callback_query") or {}
+        print(
+            "CALLBACK DEBUG:",
+            {
+                "id": callback.get("id"),
+                "data": callback.get("data"),
+                "from": (callback.get("from") or {}).get("username"),
+            },
+            flush=True
+        )
+        return "ok", 200
+
+    # Supergroup/topic messages: used for Predlozhka and collecting thread_id.
+    # This does not affect the existing channel_post -> Sheets -> VK flow.
+    if "message" in update:
+        message = update["message"]
+        try:
+            send_predlozhka_to_sheets(message)
+        except Exception as e:
+            print("MESSAGE HANDLER ERROR:", str(e), flush=True)
+
     if "channel_post" in update:
         post = update["channel_post"]
 
         debug_post_media(post)
-
-    # ===== THREAD DEBUG (SAFE ADDITION) =====
-    try:
-        chat = post.get("chat") or {}
-        chat_id = chat.get("id")
-        thread_id = post.get("message_thread_id")
-
-        print("🔥 THREAD DEBUG chat_id:", chat_id, flush=True)
-        print("🔥 THREAD DEBUG thread_id:", thread_id, flush=True)
-        print("🔥 THREAD DEBUG text:", (post.get("text") or post.get("caption")), flush=True)
-    except Exception as e:
-        print("THREAD DEBUG ERROR:", e, flush=True)
-
+        debug_thread_info(post, "channel_post")
 
         try:
             send_to_sheets(post)
@@ -642,42 +976,3 @@ def telegram_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
-
-
-
-# =========================
-# SAFE UPGRADE LAYER (NON-BREAKING ADDITION)
-# =========================
-
-THREAD_MAP = {}  # will be filled later from Render logs
-
-def extract_links_from_post(post: dict):
-    text = post.get("text") or post.get("caption") or ""
-    yandex = None
-    common = None
-
-    if isinstance(text, str):
-        if "music.yandex" in text:
-            yandex = text
-        if "band.link" in text or "linkfire" in text:
-            common = text
-
-    entities = post.get("entities") or post.get("caption_entities") or []
-    for e in entities:
-        if e.get("type") == "text_link":
-            url = e.get("url", "")
-            if "music.yandex" in url:
-                yandex = url
-            else:
-                common = url
-
-    return yandex, common
-
-
-def get_thread_info(post: dict):
-    chat = post.get("chat") or {}
-    return chat.get("id"), post.get("message_thread_id")
-
-
-def safe_genre(thread_id):
-    return THREAD_MAP.get(thread_id, "unknown")
