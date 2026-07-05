@@ -32,6 +32,11 @@ PREDLOZHKA_CAPTURE_ENABLED = os.environ.get("PREDLOZHKA_CAPTURE_ENABLED", "0") =
 PREDLOZHKA_SHEET_NAME = os.environ.get("PREDLOZHKA_SHEET_NAME", "Предложка")
 PUBLISHED_SHEET_NAME = os.environ.get("PUBLISHED_SHEET_NAME", "Таблица контента редакции")
 
+# Review engine is disabled by default for safe rollout.
+# Enable after Apps Script is updated: REVIEW_ENGINE_ENABLED=1
+REVIEW_ENGINE_ENABLED = os.environ.get("REVIEW_ENGINE_ENABLED", "0") == "1"
+REVIEW_CHECK_INTERVAL_SEC = int(os.environ.get("REVIEW_CHECK_INTERVAL_SEC", "3600"))
+
 # ======================
 # PREDLOZHKA THREAD MAP
 # ======================
@@ -179,6 +184,16 @@ def get_vk_config(channel_username: str):
 def telegram_api(method: str, data: Optional[dict] = None) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     response = requests.post(url, data=data or {}, timeout=HTTP_TIMEOUT)
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API error in {method}: {result}")
+    return result["result"]
+
+
+def telegram_api_json(method: str, payload: Optional[dict] = None) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    response = requests.post(url, json=payload or {}, timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     result = response.json()
     if not result.get("ok"):
@@ -863,6 +878,267 @@ def buffer_album_post(post: dict):
         timer.start()
 
 
+
+
+# ======================
+# REVIEW ENGINE — SAFE ADDITION
+# ======================
+review_scheduler_started = False
+review_scheduler_lock = threading.Lock()
+
+
+def sheets_get(action: str, params: Optional[dict] = None) -> dict:
+    payload = {"action": action}
+    if params:
+        payload.update(params)
+
+    resp = requests.get(WEBHOOK_URL, params=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def sheets_post_action(action: str, payload: Optional[dict] = None) -> dict:
+    data = {"action": action}
+    if payload:
+        data.update(payload)
+
+    resp = requests.post(WEBHOOK_URL, json=data, timeout=60)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_review_buttons(row_number) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "👍 ОБЗОР ЕСТЬ НА КАНАЛЕ",
+                    "callback_data": f"review_done:{row_number}",
+                }
+            ],
+            [
+                {
+                    "text": "👀 ПОКАЗАТЬ ОБЗОР В ГРУППЕ БОТА",
+                    "callback_data": f"review_show:{row_number}",
+                }
+            ],
+        ]
+    }
+
+
+def send_review_reminder(reminder: dict):
+    chat_id = reminder.get("chat_id") or reminder.get("Chat ID")
+    if not chat_id:
+        print("REVIEW REMINDER SKIP: no chat_id", reminder, flush=True)
+        return
+
+    thread_id = reminder.get("thread_id") or reminder.get("Thread ID")
+    source_message_id = reminder.get("message_id") or reminder.get("messageId") or reminder.get("Message ID")
+    row_number = reminder.get("row") or reminder.get("row_number")
+    title = (reminder.get("title") or reminder.get("Title") or "").strip()
+    genre = reminder.get("genre") or reminder.get("Genre") or ""
+    source_link = reminder.get("link") or reminder.get("Link") or ""
+    days_old = reminder.get("days_old") or reminder.get("daysOld") or "14+"
+    yandex_link = reminder.get("yandex_link") or reminder.get("Yandex Link") or ""
+    common_link = reminder.get("common_link") or reminder.get("Common Link") or ""
+
+    text_parts = [
+        "⚠️ Напоминание по обзору",
+        "",
+        f"Обзор из раздела «{genre or 'неизвестно'}» пока не найден в публикациях.",
+        f"Прошло дней: {days_old}",
+        "",
+    ]
+
+    if title:
+        text_parts.append(title[:1200])
+        text_parts.append("")
+
+    if source_link:
+        text_parts.append(f"Исходный пост: {source_link}")
+
+    if yandex_link:
+        text_parts.append(f"Яндекс: {yandex_link}")
+
+    if common_link:
+        text_parts.append(f"Общая ссылка: {common_link}")
+
+    payload = {
+        "chat_id": chat_id,
+        "text": "\n".join(text_parts),
+        "reply_markup": build_review_buttons(row_number),
+        "disable_web_page_preview": True,
+    }
+
+    if thread_id:
+        try:
+            payload["message_thread_id"] = int(thread_id)
+        except Exception:
+            pass
+
+    if source_message_id:
+        try:
+            payload["reply_to_message_id"] = int(source_message_id)
+            payload["allow_sending_without_reply"] = True
+        except Exception:
+            pass
+
+    telegram_api_json("sendMessage", payload)
+    print("REVIEW REMINDER SENT:", {"row": row_number, "chat_id": chat_id, "thread_id": thread_id}, flush=True)
+
+
+def run_review_check_once():
+    if not REVIEW_ENGINE_ENABLED:
+        return
+
+    try:
+        result = sheets_get("check_reviews")
+        print("REVIEW CHECK RESULT:", result, flush=True)
+
+        reminders = result.get("reminders") or []
+        for reminder in reminders:
+            try:
+                send_review_reminder(reminder)
+            except Exception as e:
+                print("REVIEW REMINDER ERROR:", str(e), reminder, flush=True)
+
+    except Exception as e:
+        print("REVIEW CHECK ERROR:", str(e), flush=True)
+
+
+def review_scheduler_loop():
+    print("REVIEW SCHEDULER STARTED", {"interval_sec": REVIEW_CHECK_INTERVAL_SEC}, flush=True)
+
+    # First check shortly after boot, then by interval.
+    time.sleep(20)
+
+    while True:
+        run_review_check_once()
+        time.sleep(REVIEW_CHECK_INTERVAL_SEC)
+
+
+def start_review_scheduler():
+    global review_scheduler_started
+
+    if not REVIEW_ENGINE_ENABLED:
+        print("REVIEW ENGINE DISABLED: set REVIEW_ENGINE_ENABLED=1 after Apps Script update", flush=True)
+        return
+
+    with review_scheduler_lock:
+        if review_scheduler_started:
+            return
+
+        t = threading.Thread(target=review_scheduler_loop, daemon=True)
+        t.start()
+        review_scheduler_started = True
+
+
+def callback_message_context(callback: dict) -> dict:
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    return {
+        "chat_id": chat.get("id"),
+        "thread_id": message.get("message_thread_id"),
+    }
+
+
+def send_review_card(row_number, context: Optional[dict] = None):
+    review = sheets_get("get_review", {"row": str(row_number)})
+
+    if review.get("error"):
+        text = f"Не смог найти обзор в таблице: {review.get('error')}"
+    else:
+        text_parts = [
+            "👀 Обзор из Предложки",
+            "",
+            review.get("title") or "",
+        ]
+
+        if review.get("link"):
+            text_parts.append("")
+            text_parts.append(f"Исходный пост: {review.get('link')}")
+
+        if review.get("yandex_link"):
+            text_parts.append(f"Яндекс: {review.get('yandex_link')}")
+
+        if review.get("common_link"):
+            text_parts.append(f"Общая ссылка: {review.get('common_link')}")
+
+        text = "\n".join([p for p in text_parts if p is not None])[:3900]
+
+    if not context:
+        return
+
+    chat_id = context.get("chat_id")
+    if not chat_id:
+        return
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+
+    thread_id = context.get("thread_id")
+    if thread_id:
+        try:
+            payload["message_thread_id"] = int(thread_id)
+        except Exception:
+            pass
+
+    telegram_api_json("sendMessage", payload)
+
+
+def handle_review_callback(callback: dict):
+    data = callback.get("data") or ""
+    callback_id = callback.get("id")
+    user = callback.get("from") or {}
+    username = user.get("username") or user.get("first_name") or str(user.get("id") or "unknown")
+    context = callback_message_context(callback)
+
+    if data.startswith("review_done:"):
+        row_number = data.split(":", 1)[1]
+        result = sheets_post_action("mark_review_done", {
+            "row": row_number,
+            "found_in": f"manual:{username}",
+        })
+
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "Отметил: обзор есть на канале",
+            "show_alert": False,
+        })
+
+        if context.get("chat_id"):
+            payload = {
+                "chat_id": context.get("chat_id"),
+                "text": f"✅ Отметил обзор как опубликованный вручную. Строка: {row_number}",
+            }
+            if context.get("thread_id"):
+                try:
+                    payload["message_thread_id"] = int(context.get("thread_id"))
+                except Exception:
+                    pass
+            telegram_api_json("sendMessage", payload)
+
+        print("REVIEW MANUAL DONE:", {"row": row_number, "user": username, "result": result}, flush=True)
+        return True
+
+    if data.startswith("review_show:"):
+        row_number = data.split(":", 1)[1]
+
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "Показываю обзор",
+            "show_alert": False,
+        })
+
+        send_review_card(row_number, context)
+        return True
+
+    return False
+
+
 @app.get("/vk_auth")
 def vk_auth():
     secret = request.args.get("secret", "")
@@ -947,7 +1223,7 @@ def home():
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
 
-    # Callback hooks for future buttons. Safe no-op for now.
+    # Callback buttons for review reminders. Safe for other callbacks.
     if "callback_query" in update:
         callback = update.get("callback_query") or {}
         print(
@@ -959,6 +1235,19 @@ def telegram_webhook():
             },
             flush=True
         )
+        try:
+            if handle_review_callback(callback):
+                return "ok", 200
+        except Exception as e:
+            print("CALLBACK ERROR:", str(e), flush=True)
+            try:
+                telegram_api("answerCallbackQuery", {
+                    "callback_query_id": callback.get("id"),
+                    "text": "Ошибка обработки кнопки",
+                    "show_alert": True,
+                })
+            except Exception:
+                pass
         return "ok", 200
 
     # Supergroup/topic messages: used for Predlozhka and collecting thread_id.
@@ -994,4 +1283,5 @@ def telegram_webhook():
 
 
 if __name__ == "__main__":
+    start_review_scheduler()
     app.run(host="0.0.0.0", port=PORT)
