@@ -610,6 +610,19 @@ def telegram_webhook():
 
         debug_post_media(post)
 
+    # ===== THREAD DEBUG (SAFE ADDITION) =====
+    try:
+        chat = post.get("chat") or {}
+        chat_id = chat.get("id")
+        thread_id = post.get("message_thread_id")
+
+        print("🔥 THREAD DEBUG chat_id:", chat_id, flush=True)
+        print("🔥 THREAD DEBUG thread_id:", thread_id, flush=True)
+        print("🔥 THREAD DEBUG text:", (post.get("text") or post.get("caption")), flush=True)
+    except Exception as e:
+        print("THREAD DEBUG ERROR:", e, flush=True)
+
+
         try:
             send_to_sheets(post)
         except Exception as e:
