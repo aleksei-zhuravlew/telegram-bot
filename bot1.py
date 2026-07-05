@@ -629,3 +629,42 @@ def telegram_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
+
+
+
+# =========================
+# SAFE UPGRADE LAYER (NON-BREAKING ADDITION)
+# =========================
+
+THREAD_MAP = {}  # will be filled later from Render logs
+
+def extract_links_from_post(post: dict):
+    text = post.get("text") or post.get("caption") or ""
+    yandex = None
+    common = None
+
+    if isinstance(text, str):
+        if "music.yandex" in text:
+            yandex = text
+        if "band.link" in text or "linkfire" in text:
+            common = text
+
+    entities = post.get("entities") or post.get("caption_entities") or []
+    for e in entities:
+        if e.get("type") == "text_link":
+            url = e.get("url", "")
+            if "music.yandex" in url:
+                yandex = url
+            else:
+                common = url
+
+    return yandex, common
+
+
+def get_thread_info(post: dict):
+    chat = post.get("chat") or {}
+    return chat.get("id"), post.get("message_thread_id")
+
+
+def safe_genre(thread_id):
+    return THREAD_MAP.get(thread_id, "unknown")
