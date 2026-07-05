@@ -37,6 +37,13 @@ PUBLISHED_SHEET_NAME = os.environ.get("PUBLISHED_SHEET_NAME", "Таблица к
 REVIEW_ENGINE_ENABLED = os.environ.get("REVIEW_ENGINE_ENABLED", "0") == "1"
 REVIEW_CHECK_INTERVAL_SEC = int(os.environ.get("REVIEW_CHECK_INTERVAL_SEC", "3600"))
 
+# Digest engine uses the same scheduler. Enabled by default when REVIEW_ENGINE_ENABLED=1.
+DIGEST_ENGINE_ENABLED = os.environ.get(
+    "DIGEST_ENGINE_ENABLED",
+    "1" if REVIEW_ENGINE_ENABLED else "0"
+) == "1"
+DIGEST_SIZE = int(os.environ.get("DIGEST_SIZE", "5"))
+
 # ======================
 # PREDLOZHKA THREAD MAP
 # ======================
@@ -987,6 +994,135 @@ def send_review_reminder(reminder: dict):
     print("REVIEW REMINDER SENT:", {"row": row_number, "chat_id": chat_id, "thread_id": thread_id}, flush=True)
 
 
+
+def build_telegram_message_link(chat_id, message_id) -> str:
+    if not chat_id or not message_id:
+        return ""
+
+    chat_id_str = str(chat_id)
+    if chat_id_str.startswith("-100"):
+        return f"https://t.me/c/{chat_id_str[4:]}/{message_id}"
+
+    return ""
+
+
+def extract_digest_title(text: str) -> str:
+    """
+    Keeps the digest compact: first meaningful line, without hashtag-only noise.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for line in lines:
+        low = line.lower()
+        if low.startswith("#сверхновые"):
+            continue
+        if low in ("яндекс музыка", "слушать везде"):
+            continue
+        if "яндекс музыка" in low and "слушать" in low and len(line) < 80:
+            continue
+        return line[:180]
+    return "Публикация"
+
+
+def build_digest_text(digest: dict) -> str:
+    genre = digest.get("genre") or digest.get("Genre") or "жанр"
+    items = digest.get("items") or []
+    count = digest.get("count") or len(items) or DIGEST_SIZE
+
+    title = f"#сверхновые: {genre}"
+    text_parts = [
+        title,
+        "",
+        f"Собрали {count} новых публикаций:",
+        "",
+    ]
+
+    for idx, item in enumerate(items, start=1):
+        item_title = extract_digest_title(item.get("title") or item.get("Title") or "")
+        source_link = item.get("link") or item.get("Link") or ""
+        yandex = item.get("yandex_link") or item.get("Yandex Link") or ""
+        common = item.get("common_link") or item.get("Common Link") or ""
+
+        line = f"{idx}. {item_title}"
+        if source_link:
+            line += f"\n   Исходник: {source_link}"
+        if yandex:
+            line += f"\n   Яндекс: {str(yandex).split()[0]}"
+        if common:
+            line += f"\n   Слушать везде: {str(common).split()[0]}"
+
+        text_parts.append(line)
+        text_parts.append("")
+
+    return "\n".join(text_parts).strip()[:3900]
+
+
+def send_ready_digest(digest: dict):
+    chat_id = digest.get("chat_id") or digest.get("Chat ID")
+    thread_id = digest.get("thread_id") or digest.get("Thread ID")
+    rows = digest.get("rows") or []
+    genre = digest.get("genre") or digest.get("Genre") or ""
+
+    if not chat_id:
+        print("DIGEST SKIP: no chat_id", digest, flush=True)
+        return
+
+    text = build_digest_text(digest)
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+
+    if thread_id:
+        try:
+            payload["message_thread_id"] = int(thread_id)
+        except Exception:
+            pass
+
+    result = telegram_api_json("sendMessage", payload)
+    message_id = result.get("message_id")
+    digest_link = build_telegram_message_link(chat_id, message_id) or "digest_sent"
+
+    mark_result = sheets_post_action("mark_digest_done", {
+        "rows": ",".join([str(r) for r in rows]),
+        "found_in": digest_link,
+    })
+
+    print(
+        "DIGEST SENT:",
+        {
+            "genre": genre,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "rows": rows,
+            "message_id": message_id,
+            "digest_link": digest_link,
+            "mark_result": mark_result,
+        },
+        flush=True
+    )
+
+
+def run_digest_check_once():
+    if not DIGEST_ENGINE_ENABLED:
+        return
+
+    try:
+        result = sheets_get("get_ready_digests", {"size": str(DIGEST_SIZE)})
+        print("DIGEST CHECK RESULT:", result, flush=True)
+
+        digests = result.get("digests") or []
+        for digest in digests:
+            try:
+                send_ready_digest(digest)
+            except Exception as e:
+                print("DIGEST SEND ERROR:", str(e), digest, flush=True)
+
+    except Exception as e:
+        print("DIGEST CHECK ERROR:", str(e), flush=True)
+
+
 def run_review_check_once():
     if not REVIEW_ENGINE_ENABLED:
         return
@@ -1014,14 +1150,15 @@ def review_scheduler_loop():
 
     while True:
         run_review_check_once()
+        run_digest_check_once()
         time.sleep(REVIEW_CHECK_INTERVAL_SEC)
 
 
 def start_review_scheduler():
     global review_scheduler_started
 
-    if not REVIEW_ENGINE_ENABLED:
-        print("REVIEW ENGINE DISABLED: set REVIEW_ENGINE_ENABLED=1 after Apps Script update", flush=True)
+    if not REVIEW_ENGINE_ENABLED and not DIGEST_ENGINE_ENABLED:
+        print("REVIEW/DIGEST ENGINE DISABLED: set REVIEW_ENGINE_ENABLED=1 after Apps Script update", flush=True)
         return
 
     with review_scheduler_lock:
