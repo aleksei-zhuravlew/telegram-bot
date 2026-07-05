@@ -32,15 +32,34 @@ PREDLOZHKA_CAPTURE_ENABLED = os.environ.get("PREDLOZHKA_CAPTURE_ENABLED", "0") =
 PREDLOZHKA_SHEET_NAME = os.environ.get("PREDLOZHKA_SHEET_NAME", "Предложка")
 PUBLISHED_SHEET_NAME = os.environ.get("PUBLISHED_SHEET_NAME", "Таблица контента редакции")
 
-# Fill later after Render logs, or set in Render env as JSON:
-# {"15":"rock","39":"indie","83":"pop"}
-THREAD_MAP_JSON = os.environ.get("THREAD_MAP_JSON", "{}")
+# ======================
+# PREDLOZHKA THREAD MAP
+# ======================
+# Default production map collected from Render logs.
+# Can still be overridden/extended from Render env THREAD_MAP_JSON if needed.
+DEFAULT_THREAD_MAP = {
+    645: "rock",
+    641: "indie",
+    649: "electronica",
+    647: "folk",
+    643: "pop",
+    653: "underground",
+    651: "hiphop",
+}
 
-try:
-    THREAD_MAP = {int(k): str(v) for k, v in json.loads(THREAD_MAP_JSON).items()}
-except Exception as e:
-    print("THREAD_MAP_JSON ERROR:", str(e), flush=True)
-    THREAD_MAP = {}
+# Optional override/extension in Render env, format:
+# {"645":"rock","641":"indie","649":"electronica"}
+THREAD_MAP_JSON = os.environ.get("THREAD_MAP_JSON", "")
+
+THREAD_MAP = DEFAULT_THREAD_MAP.copy()
+
+if THREAD_MAP_JSON:
+    try:
+        THREAD_MAP.update({int(k): str(v) for k, v in json.loads(THREAD_MAP_JSON).items()})
+    except Exception as e:
+        print("THREAD_MAP_JSON ERROR:", str(e), flush=True)
+
+print("THREAD_MAP LOADED:", THREAD_MAP, flush=True)
 
 COMMON_LINK_DOMAINS = (
     "band.link",
