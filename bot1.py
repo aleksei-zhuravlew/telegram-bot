@@ -32,6 +32,22 @@ PREDLOZHKA_CAPTURE_ENABLED = os.environ.get("PREDLOZHKA_CAPTURE_ENABLED", "0") =
 PREDLOZHKA_SHEET_NAME = os.environ.get("PREDLOZHKA_SHEET_NAME", "Предложка")
 PUBLISHED_SHEET_NAME = os.environ.get("PUBLISHED_SHEET_NAME", "Таблица контента редакции")
 
+# SAFETY FILTER:
+# Only messages from the real Predlozhka supergroup are written to the Predlozhka sheet.
+# This prevents the bot from capturing other editorial chats/statistics chats.
+PREDLOZHKA_ALLOWED_CHAT_IDS_RAW = os.environ.get(
+    "PREDLOZHKA_ALLOWED_CHAT_IDS",
+    "-1003533638771"
+)
+
+PREDLOZHKA_ALLOWED_CHAT_IDS = set()
+for _chat_id in PREDLOZHKA_ALLOWED_CHAT_IDS_RAW.split(","):
+    _chat_id = _chat_id.strip()
+    if _chat_id:
+        PREDLOZHKA_ALLOWED_CHAT_IDS.add(_chat_id)
+
+print("PREDLOZHKA_ALLOWED_CHAT_IDS:", sorted(PREDLOZHKA_ALLOWED_CHAT_IDS), flush=True)
+
 # Review engine is disabled by default for safe rollout.
 # Enable after Apps Script is updated: REVIEW_ENGINE_ENABLED=1
 REVIEW_ENGINE_ENABLED = os.environ.get("REVIEW_ENGINE_ENABLED", "0") == "1"
@@ -559,12 +575,40 @@ def debug_thread_info(post: dict, source: str):
         print("THREAD DEBUG ERROR:", str(e), flush=True)
 
 
+
+def is_allowed_predlozhka_chat(post: dict) -> bool:
+    chat_id = get_chat_id(post)
+
+    if chat_id is None:
+        return False
+
+    chat_id_str = str(chat_id)
+
+    if not PREDLOZHKA_ALLOWED_CHAT_IDS:
+        # Extra safe default: if the env is empty, capture nothing.
+        return False
+
+    return chat_id_str in PREDLOZHKA_ALLOWED_CHAT_IDS
+
+
 def send_predlozhka_to_sheets(post: dict):
     """
     Writes supergroup/topic messages to the Predlozhka sheet.
     Disabled by default for safety until Apps Script is updated.
     """
     debug_thread_info(post, "message")
+
+    if not is_allowed_predlozhka_chat(post):
+        print(
+            "PREDLOZHKA CAPTURE SKIPPED: chat_id is not allowed",
+            {
+                "chat_id": get_chat_id(post),
+                "allowed": sorted(PREDLOZHKA_ALLOWED_CHAT_IDS),
+                "text": get_post_text(post)[:120],
+            },
+            flush=True
+        )
+        return
 
     if not PREDLOZHKA_CAPTURE_ENABLED:
         print("PREDLOZHKA CAPTURE DISABLED: set PREDLOZHKA_CAPTURE_ENABLED=1 after Apps Script update", flush=True)
@@ -1023,35 +1067,119 @@ def extract_digest_title(text: str) -> str:
     return "Публикация"
 
 
+GENRE_LABELS = {
+    "rock": "Рок",
+    "indie": "Инди",
+    "electronica": "Электроника",
+    "folk": "Фолк",
+    "pop": "Поп",
+    "underground": "Андеграунд",
+    "hiphop": "Хип-хоп",
+}
+
+
+def html_escape(value: str) -> str:
+    return (
+        str(value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def genre_label(genre: str) -> str:
+    genre_clean = (genre or "").strip()
+    return GENRE_LABELS.get(genre_clean, genre_clean.capitalize() if genre_clean else "жанра")
+
+
+def split_digest_post_text(text: str):
+    """
+    Returns: (artist_song_title, review_text)
+
+    Expected editorial format:
+    Исполнитель — Название
+    #сверхновые
+    Текст обзора
+    Автор: ...
+    @editor (удалить перед публикацией)
+    скачать обложку
+
+    We keep the actual review text, but remove service/editorial lines:
+    hashtags, mentions, author, cover-download links, and music-link labels.
+    """
+    raw_lines = [line.strip() for line in (text or "").splitlines()]
+    lines = [line for line in raw_lines if line]
+
+    title = ""
+    body_lines = []
+
+    for line in lines:
+        low = line.lower()
+
+        if low.startswith("#"):
+            continue
+        if low.startswith("@"):
+            continue
+        if low.startswith("автор:") or low.startswith("автор —") or low.startswith("автор -"):
+            continue
+        if low.startswith("яндекс:") or low.startswith("общая ссылка:"):
+            continue
+        if low.startswith("http://") or low.startswith("https://"):
+            continue
+        if "яндекс музыка" in low and ("слушать" in low or "|" in low):
+            continue
+        if "скачать облож" in low or "удалить перед публикацией" in low:
+            continue
+
+        if not title:
+            title = line
+        else:
+            body_lines.append(line)
+
+    if not title:
+        title = extract_digest_title(text)
+
+    review_text = "\n".join(body_lines).strip()
+    return title, review_text
+
+
+def first_link(value: str) -> str:
+    if not value:
+        return ""
+    return str(value).split()[0].strip()
+
+
 def build_digest_text(digest: dict) -> str:
-    genre = digest.get("genre") or digest.get("Genre") or "жанр"
+    genre = digest.get("genre") or digest.get("Genre") or ""
     items = digest.get("items") or []
-    count = digest.get("count") or len(items) or DIGEST_SIZE
 
-    title = f"#сверхновые: {genre}"
-    text_parts = [
-        title,
-        "",
-        f"Собрали {count} новых публикаций:",
-        "",
-    ]
+    header = f"Дайджест сверхновых жанра {html_escape(genre_label(genre))}"
+    text_parts = [header, ""]
 
-    for idx, item in enumerate(items, start=1):
-        item_title = extract_digest_title(item.get("title") or item.get("Title") or "")
-        source_link = item.get("link") or item.get("Link") or ""
-        yandex = item.get("yandex_link") or item.get("Yandex Link") or ""
-        common = item.get("common_link") or item.get("Common Link") or ""
+    for item in items:
+        raw_text = item.get("title") or item.get("Title") or ""
+        item_title, review_text = split_digest_post_text(raw_text)
 
-        line = f"{idx}. {item_title}"
-        if source_link:
-            line += f"\n   Исходник: {source_link}"
-        if yandex:
-            line += f"\n   Яндекс: {str(yandex).split()[0]}"
-        if common:
-            line += f"\n   Слушать везде: {str(common).split()[0]}"
+        yandex = first_link(item.get("yandex_link") or item.get("Yandex Link") or "")
+        common = first_link(item.get("common_link") or item.get("Common Link") or "")
+        # Главред просит вшитую гиперссылку именно на мультиссылку.
+        # Если Common Link нет, используем Яндекс как fallback.
+        link_for_title = common or yandex
 
-        text_parts.append(line)
+        safe_title = html_escape(item_title)
+
+        if link_for_title:
+            text_parts.append(f'<a href="{html_escape(link_for_title)}">{safe_title}</a>')
+        else:
+            text_parts.append(f"<b>{safe_title}</b>")
+
+        if review_text:
+            text_parts.append("")
+            text_parts.append(html_escape(review_text))
+
         text_parts.append("")
+
+    text_parts.append("#сверхновые")
 
     return "\n".join(text_parts).strip()[:3900]
 
@@ -1071,6 +1199,7 @@ def send_ready_digest(digest: dict):
     payload = {
         "chat_id": chat_id,
         "text": text,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
 
