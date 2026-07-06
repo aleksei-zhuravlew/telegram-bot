@@ -93,10 +93,13 @@ print("THREAD_MAP LOADED:", THREAD_MAP, flush=True)
 COMMON_LINK_DOMAINS = (
     "band.link",
     "bnd.lc",
+    "bfan.link",
+    "bff.link",
     "lnk.to",
     "linkfire",
     "ffm.to",
     "song.link",
+    "songwhip",
     "onerpm.link",
     "hyperfollow",
     "taplink",
@@ -419,7 +422,7 @@ def is_common_music_link(url: str) -> bool:
     if not url:
         return False
 
-    low = url.lower()
+    low = url.lower().strip()
 
     if is_yandex_music_link(low):
         return False
@@ -427,15 +430,26 @@ def is_common_music_link(url: str) -> bool:
     excluded = (
         "t.me/",
         "telegram.me/",
+        "telegra.ph/",
         "vk.com/",
         "youtube.com/",
         "youtu.be/",
         "instagram.com/",
+        "docs.google.com/",
+        "drive.google.com/",
     )
     if any(domain in low for domain in excluded):
         return False
 
-    return any(domain in low for domain in COMMON_LINK_DOMAINS)
+    if any(domain in low for domain in COMMON_LINK_DOMAINS):
+        return True
+
+    # Fallback for new smartlink providers:
+    # any external http(s) link can be a Common Link if it is not excluded above.
+    if low.startswith("http://") or low.startswith("https://"):
+        return True
+
+    return False
 
 
 def tg_entity_slice(text: str, offset: int, length: int) -> str:
@@ -1199,13 +1213,30 @@ def build_digest_text(digest: dict) -> str:
         safe_title = html_escape(item_title)
 
         if link_for_title:
-            text_parts.append(f'<a href="{html_escape(link_for_title)}">{safe_title}</a>')
+            # Bold clickable artist/title.
+            text_parts.append(f'<b><a href="{html_escape(link_for_title)}">{safe_title}</a></b>')
         else:
             text_parts.append(f"<b>{safe_title}</b>")
 
         if review_text:
             text_parts.append("")
-            text_parts.append(html_escape(review_text))
+
+            review_lines = [line.strip() for line in review_text.splitlines() if line.strip()]
+
+            if review_lines:
+                # First semantic line after artist/title becomes a Telegram quote.
+                # Example:
+                # Artist - Song
+                # Что-то на западном      ← quote
+                # Main review text        ← normal text
+                quote_line = review_lines[0]
+                rest_text = "\n".join(review_lines[1:]).strip()
+
+                text_parts.append(f"<blockquote>{html_escape(quote_line)}</blockquote>")
+
+                if rest_text:
+                    text_parts.append("")
+                    text_parts.append(html_escape(rest_text))
 
         text_parts.append("")
 
