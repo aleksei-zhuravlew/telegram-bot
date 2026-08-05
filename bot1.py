@@ -70,7 +70,7 @@ DIGEST_SIZE = int(os.environ.get("DIGEST_SIZE", "5"))
 AUTOPUBLISH_PREVIEW_ENABLED = os.environ.get("AUTOPUBLISH_PREVIEW_ENABLED", "0") == "1"
 AUTOPUBLISH_TIMEZONE = os.environ.get("AUTOPUBLISH_TIMEZONE", "Europe/Moscow")
 AUTOPUBLISH_CHECK_INTERVAL_SEC = int(os.environ.get("AUTOPUBLISH_CHECK_INTERVAL_SEC", "20"))
-AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")
+AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")  # legacy fallback; Sheets is used for new schedules
 GENRE_FRAME_DIR = os.environ.get("GENRE_FRAME_DIR", "genre_frames")
 
 TARGET_CHANNELS = {
@@ -1562,14 +1562,74 @@ def send_publish_preview(post: dict):
                     pass
 
 
+def _utf16_length(value: str) -> int:
+    return len((value or "").encode("utf-16-le")) // 2
+
+
+def ensure_author_custom_emoji_entity(caption: str, entities: List[dict]) -> List[dict]:
+    """Force the configured author emoji to remain a Telegram custom emoji on publish."""
+    result = [dict(item) for item in (entities or []) if isinstance(item, dict)]
+
+    for author, config in AUTHOR_EMOJI_MAP.items():
+        emoji_id = str(config.get("emoji_id") or "").strip()
+        visible = str(config.get("visible") or "🙂")
+        if not emoji_id or not visible:
+            continue
+
+        # We place the emoji before the word "Автор". Find that exact rendered line.
+        patterns = [
+            f"{visible} Автор: {author}",
+            f"{visible} Автор — {author}",
+            f"{visible} Автор - {author}",
+        ]
+        start_index = -1
+        for pattern in patterns:
+            start_index = caption.find(pattern)
+            if start_index >= 0:
+                break
+
+        # Fallback: find the visible emoji immediately before any Автор line.
+        if start_index < 0:
+            match = re.search(re.escape(visible) + r"\s+Автор\s*[:\-–—]", caption, flags=re.IGNORECASE)
+            if match:
+                start_index = match.start()
+
+        if start_index < 0:
+            continue
+
+        offset = _utf16_length(caption[:start_index])
+        length = _utf16_length(visible)
+
+        # Remove a stale/duplicate entity at the same position, then add the correct ID.
+        result = [
+            item for item in result
+            if not (
+                item.get("type") == "custom_emoji"
+                and int(item.get("offset", -1)) == offset
+                and int(item.get("length", -1)) == length
+            )
+        ]
+        result.append({
+            "type": "custom_emoji",
+            "offset": offset,
+            "length": length,
+            "custom_emoji_id": emoji_id,
+        })
+
+    result.sort(key=lambda item: (int(item.get("offset", 0)), -int(item.get("length", 0))))
+    return result
+
+
 def extract_preview_payload(message: dict) -> dict:
     """Extract photo/caption/entities from the preview message for exact re-sending."""
     photos = message.get("photo") or []
     photo_file_id = photos[-1].get("file_id") if photos else ""
+    caption = message.get("caption") or ""
+    entities = ensure_author_custom_emoji_entity(caption, message.get("caption_entities") or [])
     return {
         "photo_file_id": photo_file_id,
-        "caption": message.get("caption") or "",
-        "caption_entities": message.get("caption_entities") or [],
+        "caption": caption,
+        "caption_entities": entities,
     }
 
 
@@ -1583,11 +1643,16 @@ def publish_preview_payload(preview: dict, genre: str) -> dict:
     if not photo_file_id:
         raise RuntimeError("Preview photo file_id is missing")
 
+    caption = preview.get("caption") or ""
+    caption_entities = ensure_author_custom_emoji_entity(
+        caption,
+        preview.get("caption_entities") or [],
+    )
     payload = {
         "chat_id": target,
         "photo": photo_file_id,
-        "caption": preview.get("caption") or "",
-        "caption_entities": preview.get("caption_entities") or [],
+        "caption": caption,
+        "caption_entities": caption_entities,
     }
     return telegram_api_json("sendPhoto", payload)
 
@@ -1736,7 +1801,6 @@ def handle_schedule_time_message(post: dict) -> bool:
         telegram_api_json("sendMessage", payload)
         return True
 
-    jobs = load_scheduled_posts()
     job = {
         "id": f"{state['chat_id']}:{state['preview_message_id']}:{int(scheduled_at.timestamp())}",
         "source_chat_id": state["chat_id"],
@@ -1744,12 +1808,18 @@ def handle_schedule_time_message(post: dict) -> bool:
         "preview": state.get("preview") or {},
         "thread_id": state.get("thread_id"),
         "genre": state["genre"],
+        "target_channel": TARGET_CHANNELS.get(state["genre"], ""),
         "scheduled_at": scheduled_at.isoformat(),
         "requested_by": user_id,
         "status": "scheduled",
     }
-    jobs.append(job)
-    save_scheduled_posts(jobs)
+
+    save_result = sheets_post_action("add_scheduled_post", {
+        "job": job,
+    })
+    if save_result.get("error"):
+        raise RuntimeError(save_result.get("error"))
+
     awaiting_schedule.pop(user_id, None)
 
     payload = {
@@ -1765,42 +1835,62 @@ def handle_schedule_time_message(post: dict) -> bool:
 def run_scheduled_posts_once():
     if not AUTOPUBLISH_PREVIEW_ENABLED:
         return
-    jobs = load_scheduled_posts()
+
+    try:
+        response = sheets_get("get_due_scheduled_posts", {"limit": "20"})
+    except Exception as e:
+        print("SCHEDULE GET DUE ERROR:", str(e), flush=True)
+        return
+
+    jobs = response.get("jobs") or []
     if not jobs:
         return
+
     now = datetime.now(get_autopublish_tz())
-    changed = False
+
     for job in jobs:
-        if job.get("status") != "scheduled":
-            continue
+        job_id = str(job.get("id") or "")
         try:
-            due = datetime.fromisoformat(job["scheduled_at"])
-            if due.tzinfo is None:
-                due = due.replace(tzinfo=get_autopublish_tz())
-            if due > now:
-                continue
             preview = job.get("preview") or {}
             if not preview:
                 raise RuntimeError("Scheduled post has no saved preview payload; recreate the schedule")
-            result = publish_preview_payload(preview, job["genre"])
-            job["status"] = "published"
-            job["published_message_id"] = result.get("message_id")
-            job["published_at"] = now.isoformat()
-            changed = True
+
+            result = publish_preview_payload(preview, job.get("genre") or "")
+            published_message_id = result.get("message_id")
+            published_link = ""
+            target = job.get("target_channel") or TARGET_CHANNELS.get(job.get("genre") or "", "")
+            if target and published_message_id:
+                published_link = f"https://t.me/{str(target).lstrip('@')}/{published_message_id}"
+
+            mark_result = sheets_post_action("mark_scheduled_post_published", {
+                "id": job_id,
+                "published_message_id": published_message_id or "",
+                "published_at": now.isoformat(),
+                "published_link": published_link,
+            })
+            if mark_result.get("error"):
+                raise RuntimeError(mark_result.get("error"))
+
             confirmation = {
-                "chat_id": job["source_chat_id"],
-                "text": f"✅ Отложенный пост опубликован в {TARGET_CHANNELS.get(job['genre'])}.",
+                "chat_id": job.get("source_chat_id"),
+                "text": f"✅ Отложенный пост опубликован в {target}.",
             }
             if job.get("thread_id"):
-                confirmation["message_thread_id"] = job["thread_id"]
-            telegram_api_json("sendMessage", confirmation)
+                confirmation["message_thread_id"] = job.get("thread_id")
+            if confirmation.get("chat_id"):
+                telegram_api_json("sendMessage", confirmation)
+
         except Exception as e:
-            job["status"] = "error"
-            job["error"] = str(e)
-            changed = True
-            print("SCHEDULED PUBLISH ERROR:", job, flush=True)
-    if changed:
-        save_scheduled_posts(jobs)
+            error_text = str(e)
+            try:
+                sheets_post_action("mark_scheduled_post_error", {
+                    "id": job_id,
+                    "error": error_text,
+                    "failed_at": now.isoformat(),
+                })
+            except Exception as mark_error:
+                print("SCHEDULE MARK ERROR FAILED:", str(mark_error), flush=True)
+            print("SCHEDULED PUBLISH ERROR:", {"job": job, "error": error_text}, flush=True)
 
 
 def autopublish_scheduler_loop():
