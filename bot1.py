@@ -5,11 +5,13 @@ import time
 import mimetypes
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 import requests
+from PIL import Image, ImageOps
 from flask import Flask, request
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -59,6 +61,52 @@ DIGEST_ENGINE_ENABLED = os.environ.get(
     "1" if REVIEW_ENGINE_ENABLED else "0"
 ) == "1"
 DIGEST_SIZE = int(os.environ.get("DIGEST_SIZE", "5"))
+
+
+# ======================
+# AUTOPUBLISH PREVIEW — SAFE MVP
+# ======================
+# Disabled by default. Enable on Render only after adding the frame files to the repo.
+AUTOPUBLISH_PREVIEW_ENABLED = os.environ.get("AUTOPUBLISH_PREVIEW_ENABLED", "0") == "1"
+AUTOPUBLISH_TIMEZONE = os.environ.get("AUTOPUBLISH_TIMEZONE", "Europe/Moscow")
+AUTOPUBLISH_CHECK_INTERVAL_SEC = int(os.environ.get("AUTOPUBLISH_CHECK_INTERVAL_SEC", "20"))
+AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")
+GENRE_FRAME_DIR = os.environ.get("GENRE_FRAME_DIR", "genre_frames")
+
+TARGET_CHANNELS = {
+    "rock": "@chto_music_rock",
+    "indie": "@chto_music_indie",
+    "folk": "@chto_music_folk",
+    "pop": "@chto_music_pop",
+    "hiphop": "@chto_music_hiphop",
+    "electronica": "@chto_music_electronica",
+    "glavred": "@chto_music",
+}
+
+GENRE_FRAME_FILES = {
+    "rock": "rock_frame.png",
+    "indie": "indie_frame.png",
+    "folk": "folk_frame.png",
+    "pop": "pop_frame.png",
+    "hiphop": "hiphop_frame.png",
+    "glavred": "main_frame.png",
+    # electronica intentionally has no frame
+}
+
+AUTHOR_EMOJI_MAP = {
+    "Алексей Журавлев": {
+        "emoji_id": "5429396071589642872",
+        "visible": "😎",
+    },
+}
+
+# In-memory state for the short dialogue after pressing “Опубликовать позже”.
+# Scheduled jobs themselves are also saved to AUTOPUBLISH_STORE_PATH.
+awaiting_schedule = {}
+scheduled_posts_lock = threading.Lock()
+autopublish_scheduler_started = False
+autopublish_scheduler_lock = threading.Lock()
+preview_dedup = {}
 
 # ======================
 # PREDLOZHKA THREAD MAP
@@ -1009,6 +1057,417 @@ def buffer_album_post(post: dict):
 
 
 # ======================
+# AUTOPUBLISH PREVIEW HELPERS
+# ======================
+def get_autopublish_tz():
+    try:
+        return ZoneInfo(AUTOPUBLISH_TIMEZONE)
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+
+def telegram_api_multipart(method: str, data: dict, files: dict) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    response = requests.post(url, data=data, files=files, timeout=UPLOAD_TIMEOUT)
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API error in {method}: {result}")
+    return result["result"]
+
+
+def resolve_frame_path(genre: str) -> str:
+    file_name = GENRE_FRAME_FILES.get(genre)
+    if not file_name:
+        return ""
+    candidates = [
+        os.path.join(GENRE_FRAME_DIR, file_name),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), GENRE_FRAME_DIR, file_name),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def prepare_framed_cover(source_path: str, genre: str) -> str:
+    """Create a 1280x1280 cover and apply the genre PNG frame when configured."""
+    with Image.open(source_path) as source:
+        cover = ImageOps.fit(source.convert("RGB"), (1280, 1280), method=Image.Resampling.LANCZOS)
+        result = cover.convert("RGBA")
+
+    frame_path = resolve_frame_path(genre)
+    if frame_path:
+        with Image.open(frame_path) as frame_source:
+            frame = frame_source.convert("RGBA").resize((1280, 1280), Image.Resampling.LANCZOS)
+            result = Image.alpha_composite(result, frame)
+    elif genre != "electronica":
+        print("AUTOPUBLISH FRAME NOT FOUND:", {"genre": genre, "dir": GENRE_FRAME_DIR}, flush=True)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp.close()
+    result.save(tmp.name, "PNG", optimize=True)
+    return tmp.name
+
+
+def normalize_author_name(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def author_emoji_html(author: str) -> str:
+    normalized = normalize_author_name(author)
+    for known_author, item in AUTHOR_EMOJI_MAP.items():
+        if normalize_author_name(known_author) == normalized:
+            emoji_id = item.get("emoji_id") or ""
+            visible = html_escape(item.get("visible") or "🙂")
+            if emoji_id:
+                return f'<tg-emoji emoji-id="{html_escape(emoji_id)}">{visible}</tg-emoji>'
+    return ""
+
+
+def build_publish_caption(post: dict) -> str:
+    """Keep the editorial text and append the author's custom emoji to the author line."""
+    text = get_post_text(post)
+    author = extract_author(text)
+    emoji_html = author_emoji_html(author)
+    if not emoji_html:
+        return html_escape(text)[:1000]
+
+    escaped_lines = []
+    replaced = False
+    for line in text.splitlines():
+        escaped = html_escape(line)
+        if not replaced and re.match(r"^\s*Автор\s*[:\-–—]", line, flags=re.IGNORECASE):
+            escaped_lines.append(f"{escaped} {emoji_html}")
+            replaced = True
+        else:
+            escaped_lines.append(escaped)
+
+    if not replaced:
+        escaped_lines.extend(["", f"Автор: {html_escape(author)} {emoji_html}"])
+
+    return "\n".join(escaped_lines).strip()[:1000]
+
+
+def build_publish_buttons(genre: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Опубликовать сейчас", "callback_data": f"pub_now:{genre}"},
+                {"text": "🕒 Опубликовать позже", "callback_data": f"pub_later:{genre}"},
+            ],
+            [
+                {"text": "❌ Отменить", "callback_data": f"pub_cancel:{genre}"},
+            ],
+        ]
+    }
+
+
+def should_build_publish_preview(post: dict) -> bool:
+    if not AUTOPUBLISH_PREVIEW_ENABLED:
+        return False
+    if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
+        return False
+    if (post.get("from") or {}).get("is_bot"):
+        return False
+    genre = get_genre_from_thread(get_thread_id(post))
+    if genre == "underground" or genre not in TARGET_CHANNELS:
+        return False
+    if not extract_image_file_id(post):
+        return False
+    message_id = post.get("message_id")
+    if not message_id:
+        return False
+    key = f"{get_chat_id(post)}:{message_id}"
+    cutoff = now_ts() - PROCESSED_TTL_SEC
+    for old_key in [k for k, ts in preview_dedup.items() if ts < cutoff]:
+        preview_dedup.pop(old_key, None)
+    if key in preview_dedup:
+        return False
+    preview_dedup[key] = now_ts()
+    return True
+
+
+def send_publish_preview(post: dict):
+    genre = get_genre_from_thread(get_thread_id(post))
+    image_file_id = extract_image_file_id(post)
+    if not genre or not image_file_id:
+        return
+
+    source_path = tg_download_file(image_file_id)
+    prepared_path = ""
+    try:
+        prepared_path = prepare_framed_cover(source_path, genre)
+        caption = build_publish_caption(post)
+        data = {
+            "chat_id": str(get_chat_id(post)),
+            "caption": caption,
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(build_publish_buttons(genre), ensure_ascii=False),
+        }
+        thread_id = get_thread_id(post)
+        if thread_id:
+            data["message_thread_id"] = str(thread_id)
+
+        with open(prepared_path, "rb") as photo:
+            result = telegram_api_multipart("sendPhoto", data, {"photo": ("ready_post.png", photo, "image/png")})
+
+        print(
+            "AUTOPUBLISH PREVIEW SENT:",
+            {"genre": genre, "preview_message_id": result.get("message_id"), "source_message_id": post.get("message_id")},
+            flush=True,
+        )
+    finally:
+        for path in (source_path, prepared_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def publish_preview_message(source_chat_id, source_message_id, genre: str) -> dict:
+    target = TARGET_CHANNELS.get(genre)
+    if not target:
+        raise RuntimeError(f"Target channel is not configured for genre={genre}")
+    return telegram_api_json("copyMessage", {
+        "chat_id": target,
+        "from_chat_id": source_chat_id,
+        "message_id": int(source_message_id),
+    })
+
+
+def load_scheduled_posts() -> List[dict]:
+    with scheduled_posts_lock:
+        try:
+            if not os.path.isfile(AUTOPUBLISH_STORE_PATH):
+                return []
+            with open(AUTOPUBLISH_STORE_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            print("SCHEDULE LOAD ERROR:", str(e), flush=True)
+            return []
+
+
+def save_scheduled_posts(items: List[dict]):
+    with scheduled_posts_lock:
+        directory = os.path.dirname(os.path.abspath(AUTOPUBLISH_STORE_PATH))
+        os.makedirs(directory, exist_ok=True)
+        tmp_path = AUTOPUBLISH_STORE_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(items, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, AUTOPUBLISH_STORE_PATH)
+
+
+def parse_schedule_time(value: str):
+    raw = (value or "").strip().lower().replace("ё", "е")
+    tz = get_autopublish_tz()
+    now = datetime.now(tz)
+
+    match = re.fullmatch(r"(сегодня|завтра)\s+(\d{1,2}):(\d{2})", raw)
+    if match:
+        day_word, hour, minute = match.groups()
+        dt = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if day_word == "завтра":
+            dt += timedelta(days=1)
+        if day_word == "сегодня" and dt <= now:
+            raise ValueError("Время сегодня уже прошло")
+        return dt
+
+    for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            if fmt == "%d.%m %H:%M":
+                parsed = parsed.replace(year=now.year)
+                if parsed.replace(tzinfo=tz) <= now:
+                    parsed = parsed.replace(year=now.year + 1)
+            dt = parsed.replace(tzinfo=tz)
+            if dt <= now:
+                raise ValueError("Указанное время уже прошло")
+            return dt
+        except ValueError as e:
+            if str(e) in ("Указанное время уже прошло",):
+                raise
+            continue
+    raise ValueError("Не понял время. Пример: сегодня 18:30, завтра 12:00 или 06.08.2026 14:00")
+
+
+def handle_publish_callback(callback: dict) -> bool:
+    data = callback.get("data") or ""
+    if not data.startswith(("pub_now:", "pub_later:", "pub_cancel:")):
+        return False
+
+    callback_id = callback.get("id")
+    user = callback.get("from") or {}
+    user_id = user.get("id")
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+    thread_id = message.get("message_thread_id")
+    genre = data.split(":", 1)[1]
+
+    if data.startswith("pub_now:"):
+        result = publish_preview_message(chat_id, message_id, genre)
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "Опубликовано",
+            "show_alert": False,
+        })
+        confirmation = {
+            "chat_id": chat_id,
+            "text": f"✅ Пост опубликован в {TARGET_CHANNELS.get(genre)}. Message ID: {result.get('message_id')}",
+        }
+        if thread_id:
+            confirmation["message_thread_id"] = thread_id
+        telegram_api_json("sendMessage", confirmation)
+        return True
+
+    if data.startswith("pub_later:"):
+        awaiting_schedule[str(user_id)] = {
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "preview_message_id": message_id,
+            "genre": genre,
+            "created_at": now_ts(),
+        }
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "Напиши время следующим сообщением",
+            "show_alert": False,
+        })
+        prompt = {
+            "chat_id": chat_id,
+            "text": "🕒 На когда поставить публикацию?\n\nПримеры:\nсегодня 18:30\nзавтра 12:00\n06.08.2026 14:00",
+        }
+        if thread_id:
+            prompt["message_thread_id"] = thread_id
+        telegram_api_json("sendMessage", prompt)
+        return True
+
+    telegram_api("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text": "Предпросмотр отменён",
+        "show_alert": False,
+    })
+    try:
+        telegram_api_json("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+    except Exception:
+        pass
+    return True
+
+
+def handle_schedule_time_message(post: dict) -> bool:
+    user_id = str((post.get("from") or {}).get("id") or "")
+    state = awaiting_schedule.get(user_id)
+    if not state:
+        return False
+    if get_chat_id(post) != state.get("chat_id") or get_thread_id(post) != state.get("thread_id"):
+        return False
+
+    text = get_post_text(post)
+    try:
+        scheduled_at = parse_schedule_time(text)
+    except ValueError as e:
+        payload = {"chat_id": get_chat_id(post), "text": f"❗ {e}"}
+        if get_thread_id(post):
+            payload["message_thread_id"] = get_thread_id(post)
+        telegram_api_json("sendMessage", payload)
+        return True
+
+    jobs = load_scheduled_posts()
+    job = {
+        "id": f"{state['chat_id']}:{state['preview_message_id']}:{int(scheduled_at.timestamp())}",
+        "source_chat_id": state["chat_id"],
+        "source_message_id": state["preview_message_id"],
+        "thread_id": state.get("thread_id"),
+        "genre": state["genre"],
+        "scheduled_at": scheduled_at.isoformat(),
+        "requested_by": user_id,
+        "status": "scheduled",
+    }
+    jobs.append(job)
+    save_scheduled_posts(jobs)
+    awaiting_schedule.pop(user_id, None)
+
+    payload = {
+        "chat_id": get_chat_id(post),
+        "text": f"✅ Поставил публикацию на {scheduled_at.strftime('%d.%m.%Y %H:%M')} ({AUTOPUBLISH_TIMEZONE}).",
+    }
+    if get_thread_id(post):
+        payload["message_thread_id"] = get_thread_id(post)
+    telegram_api_json("sendMessage", payload)
+    return True
+
+
+def run_scheduled_posts_once():
+    if not AUTOPUBLISH_PREVIEW_ENABLED:
+        return
+    jobs = load_scheduled_posts()
+    if not jobs:
+        return
+    now = datetime.now(get_autopublish_tz())
+    changed = False
+    for job in jobs:
+        if job.get("status") != "scheduled":
+            continue
+        try:
+            due = datetime.fromisoformat(job["scheduled_at"])
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=get_autopublish_tz())
+            if due > now:
+                continue
+            result = publish_preview_message(job["source_chat_id"], job["source_message_id"], job["genre"])
+            job["status"] = "published"
+            job["published_message_id"] = result.get("message_id")
+            job["published_at"] = now.isoformat()
+            changed = True
+            confirmation = {
+                "chat_id": job["source_chat_id"],
+                "text": f"✅ Отложенный пост опубликован в {TARGET_CHANNELS.get(job['genre'])}.",
+            }
+            if job.get("thread_id"):
+                confirmation["message_thread_id"] = job["thread_id"]
+            telegram_api_json("sendMessage", confirmation)
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            changed = True
+            print("SCHEDULED PUBLISH ERROR:", job, flush=True)
+    if changed:
+        save_scheduled_posts(jobs)
+
+
+def autopublish_scheduler_loop():
+    print("AUTOPUBLISH SCHEDULER STARTED", {"interval_sec": AUTOPUBLISH_CHECK_INTERVAL_SEC}, flush=True)
+    time.sleep(10)
+    while True:
+        try:
+            run_scheduled_posts_once()
+        except Exception as e:
+            print("AUTOPUBLISH SCHEDULER ERROR:", str(e), flush=True)
+        time.sleep(AUTOPUBLISH_CHECK_INTERVAL_SEC)
+
+
+def start_autopublish_scheduler():
+    global autopublish_scheduler_started
+    if not AUTOPUBLISH_PREVIEW_ENABLED:
+        print("AUTOPUBLISH PREVIEW DISABLED: set AUTOPUBLISH_PREVIEW_ENABLED=1", flush=True)
+        return
+    with autopublish_scheduler_lock:
+        if autopublish_scheduler_started:
+            return
+        thread = threading.Thread(target=autopublish_scheduler_loop, daemon=True)
+        thread.start()
+        autopublish_scheduler_started = True
+
+
+# ======================
 # REVIEW ENGINE — SAFE ADDITION
 # ======================
 review_scheduler_started = False
@@ -1597,6 +2056,8 @@ def telegram_webhook():
             flush=True
         )
         try:
+            if handle_publish_callback(callback):
+                return "ok", 200
             if handle_review_callback(callback):
                 return "ok", 200
         except Exception as e:
@@ -1623,9 +2084,21 @@ def telegram_webhook():
             print("CUSTOM EMOJI DEBUG ERROR:", str(e), flush=True)
 
         try:
+            if handle_schedule_time_message(incoming_message):
+                return "ok", 200
+        except Exception as e:
+            print("SCHEDULE TIME HANDLER ERROR:", str(e), flush=True)
+
+        try:
             send_predlozhka_to_sheets(incoming_message)
         except Exception as e:
             print("MESSAGE HANDLER ERROR:", str(e), flush=True)
+
+        try:
+            if should_build_publish_preview(incoming_message):
+                send_publish_preview(incoming_message)
+        except Exception as e:
+            print("AUTOPUBLISH PREVIEW ERROR:", str(e), flush=True)
 
     if "channel_post" in update:
         post = update["channel_post"]
