@@ -1077,17 +1077,13 @@ def telegram_api_multipart(method: str, data: dict, files: dict) -> dict:
 
 
 def resolve_frame_path(genre: str) -> str:
-    """Find the PNG frame even if the repo folder is named slightly differently."""
+    """Find the PNG frame in configured/common folders or anywhere inside the repo."""
     file_name = GENRE_FRAME_FILES.get(genre)
     if not file_name:
         return ""
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    alt_names = [
-        file_name,
-        f"{genre}_frame.png",
-        f"{genre}.png",
-    ]
+    alt_names = [file_name, f"{genre}_frame.png", f"{genre}.png"]
 
     dir_candidates = []
     raw_dirs = [
@@ -1102,11 +1098,10 @@ def resolve_frame_path(genre: str) -> str:
     for item in raw_dirs:
         if not item:
             continue
-        normalized = os.path.abspath(item) if not os.path.isabs(item) else item
+        normalized = item if os.path.isabs(item) else os.path.abspath(item)
         if normalized not in dir_candidates:
             dir_candidates.append(normalized)
 
-    # Support the case when GENRE_FRAME_DIR itself points directly to a file.
     if os.path.isfile(GENRE_FRAME_DIR):
         return GENRE_FRAME_DIR
 
@@ -1117,13 +1112,22 @@ def resolve_frame_path(genre: str) -> str:
                 print("AUTOPUBLISH FRAME FOUND:", {"genre": genre, "path": path}, flush=True)
                 return path
 
+    # Last-resort recursive search inside the deployed repository.
+    for root, _, files in os.walk(script_dir):
+        lower_map = {name.casefold(): name for name in files}
+        for candidate_name in alt_names:
+            actual = lower_map.get(candidate_name.casefold())
+            if actual:
+                path = os.path.join(root, actual)
+                print("AUTOPUBLISH FRAME FOUND RECURSIVELY:", {"genre": genre, "path": path}, flush=True)
+                return path
+
     print(
         "AUTOPUBLISH FRAME SEARCH FAILED:",
         {"genre": genre, "requested_dir": GENRE_FRAME_DIR, "checked_dirs": dir_candidates, "checked_names": alt_names},
         flush=True,
     )
     return ""
-
 
 def extract_cover_download_url(post: dict) -> str:
     """Find the hyperlink attached to a line such as “скачать обложку”."""
@@ -1240,8 +1244,11 @@ def prepare_framed_cover(source_path: str, genre: str) -> str:
                 {"genre": genre, "frame_path": frame_path, "source_path": source_path},
                 flush=True,
             )
-    elif genre != "electronica":
-        print("AUTOPUBLISH FRAME NOT FOUND:", {"genre": genre, "dir": GENRE_FRAME_DIR}, flush=True)
+    elif genre in GENRE_FRAME_FILES:
+        # Never send an unframed preview for a genre that must have a frame.
+        raise RuntimeError(
+            f"Не найдена рамка для жанра {genre}. Добавь файл {GENRE_FRAME_FILES.get(genre)} в папку genre_frames."
+        )
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     tmp.close()
@@ -1427,7 +1434,19 @@ def build_publish_caption(post: dict) -> str:
     lines = _clean_publish_lines(text)
 
     meaningful_indexes = [i for i, item in enumerate(lines) if item["text"].strip()]
-    quote_index = meaningful_indexes[1] if len(meaningful_indexes) > 1 else None
+
+    # Editorial rule:
+    # - when the first line clearly looks like “Artist — Track”, quote the next meaningful line;
+    # - otherwise quote the very first meaningful line.
+    quote_index = None
+    if meaningful_indexes:
+        first_index = meaningful_indexes[0]
+        first_line = lines[first_index]["text"].strip()
+        looks_like_title = bool(re.search(r"\S\s+[—–-]\s+\S", first_line))
+        if looks_like_title and len(meaningful_indexes) > 1:
+            quote_index = meaningful_indexes[1]
+        else:
+            quote_index = first_index
 
     rendered = []
     author_replaced = False
