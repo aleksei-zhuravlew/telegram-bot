@@ -570,6 +570,40 @@ def safe_status_for_predlozhka(post_type: str, yandex_link: str, common_link: st
     return "no_link"
 
 
+def debug_custom_emoji_entities(post: dict):
+    """Print custom_emoji_id values from incoming Telegram messages."""
+    if not post:
+        return
+
+    text = post.get("text") or post.get("caption") or ""
+    entities = (post.get("entities") or []) + (post.get("caption_entities") or [])
+
+    for entity in entities:
+        if entity.get("type") != "custom_emoji":
+            continue
+
+        custom_emoji_id = entity.get("custom_emoji_id")
+        offset = entity.get("offset")
+        length = entity.get("length")
+        visible = ""
+
+        if offset is not None and length is not None:
+            visible = tg_entity_slice(text, int(offset), int(length))
+
+        print(
+            "CUSTOM EMOJI FOUND:",
+            {
+                "custom_emoji_id": custom_emoji_id,
+                "visible": visible,
+                "from_id": (post.get("from") or {}).get("id"),
+                "from_username": (post.get("from") or {}).get("username"),
+                "chat_id": get_chat_id(post),
+                "message_id": post.get("message_id"),
+            },
+            flush=True,
+        )
+
+
 def debug_thread_info(post: dict, source: str):
     try:
         chat = post.get("chat") or {}
@@ -1549,15 +1583,7 @@ def home():
 @app.post(f"/{BOT_TOKEN}")
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
-incoming = update.get("message") or update.get("edited_message") or {}
 
-for entity in incoming.get("entities") or []:
-    if entity.get("type") == "custom_emoji":
-        print(
-            "CUSTOM EMOJI ID:",
-            entity.get("custom_emoji_id"),
-            flush=True,
-        )
     # Callback buttons for review reminders. Safe for other callbacks.
     if "callback_query" in update:
         callback = update.get("callback_query") or {}
@@ -1591,6 +1617,11 @@ for entity in incoming.get("entities") or []:
     # for messages sent by the same bot, and usually does not deliver other bots' messages.
     incoming_message = update.get("message") or update.get("edited_message")
     if incoming_message:
+        try:
+            debug_custom_emoji_entities(incoming_message)
+        except Exception as e:
+            print("CUSTOM EMOJI DEBUG ERROR:", str(e), flush=True)
+
         try:
             send_predlozhka_to_sheets(incoming_message)
         except Exception as e:
