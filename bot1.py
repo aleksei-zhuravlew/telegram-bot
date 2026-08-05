@@ -1462,7 +1462,7 @@ def build_publish_caption(post: dict) -> str:
 
         if re.match(r"^\s*Автор\s*[:\-–—]", raw_line, flags=re.IGNORECASE):
             if emoji_html:
-                line_html = f"{line_html} {emoji_html}"
+                line_html = f"{emoji_html} {line_html}"
             author_replaced = True
 
         if index == quote_index:
@@ -1473,7 +1473,7 @@ def build_publish_caption(post: dict) -> str:
     if author and emoji_html and not author_replaced:
         if rendered and rendered[-1] != "":
             rendered.append("")
-        rendered.append(f"Автор: {html_escape(author)} {emoji_html}")
+        rendered.append(f"{emoji_html} Автор: {html_escape(author)}")
 
     caption = "\n".join(rendered).strip()
     # Telegram photo captions are limited to 1024 characters after entity parsing.
