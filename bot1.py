@@ -1549,7 +1549,15 @@ def home():
 @app.post(f"/{BOT_TOKEN}")
 def telegram_webhook():
     update = request.get_json(silent=True) or {}
+incoming = update.get("message") or update.get("edited_message") or {}
 
+for entity in incoming.get("entities") or []:
+    if entity.get("type") == "custom_emoji":
+        print(
+            "CUSTOM EMOJI ID:",
+            entity.get("custom_emoji_id"),
+            flush=True,
+        )
     # Callback buttons for review reminders. Safe for other callbacks.
     if "callback_query" in update:
         callback = update.get("callback_query") or {}
