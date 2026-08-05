@@ -1562,15 +1562,34 @@ def send_publish_preview(post: dict):
                     pass
 
 
-def publish_preview_message(source_chat_id, source_message_id, genre: str) -> dict:
+def extract_preview_payload(message: dict) -> dict:
+    """Extract photo/caption/entities from the preview message for exact re-sending."""
+    photos = message.get("photo") or []
+    photo_file_id = photos[-1].get("file_id") if photos else ""
+    return {
+        "photo_file_id": photo_file_id,
+        "caption": message.get("caption") or "",
+        "caption_entities": message.get("caption_entities") or [],
+    }
+
+
+def publish_preview_payload(preview: dict, genre: str) -> dict:
+    """Send the prepared preview as a new channel post, preserving custom emoji entities."""
     target = TARGET_CHANNELS.get(genre)
     if not target:
         raise RuntimeError(f"Target channel is not configured for genre={genre}")
-    return telegram_api_json("copyMessage", {
+
+    photo_file_id = preview.get("photo_file_id") or ""
+    if not photo_file_id:
+        raise RuntimeError("Preview photo file_id is missing")
+
+    payload = {
         "chat_id": target,
-        "from_chat_id": source_chat_id,
-        "message_id": int(source_message_id),
-    })
+        "photo": photo_file_id,
+        "caption": preview.get("caption") or "",
+        "caption_entities": preview.get("caption_entities") or [],
+    }
+    return telegram_api_json("sendPhoto", payload)
 
 
 def load_scheduled_posts() -> List[dict]:
@@ -1645,7 +1664,7 @@ def handle_publish_callback(callback: dict) -> bool:
     genre = data.split(":", 1)[1]
 
     if data.startswith("pub_now:"):
-        result = publish_preview_message(chat_id, message_id, genre)
+        result = publish_preview_payload(extract_preview_payload(message), genre)
         telegram_api("answerCallbackQuery", {
             "callback_query_id": callback_id,
             "text": "Опубликовано",
@@ -1666,6 +1685,7 @@ def handle_publish_callback(callback: dict) -> bool:
             "thread_id": thread_id,
             "preview_message_id": message_id,
             "genre": genre,
+            "preview": extract_preview_payload(message),
             "created_at": now_ts(),
         }
         telegram_api("answerCallbackQuery", {
@@ -1721,6 +1741,7 @@ def handle_schedule_time_message(post: dict) -> bool:
         "id": f"{state['chat_id']}:{state['preview_message_id']}:{int(scheduled_at.timestamp())}",
         "source_chat_id": state["chat_id"],
         "source_message_id": state["preview_message_id"],
+        "preview": state.get("preview") or {},
         "thread_id": state.get("thread_id"),
         "genre": state["genre"],
         "scheduled_at": scheduled_at.isoformat(),
@@ -1758,7 +1779,10 @@ def run_scheduled_posts_once():
                 due = due.replace(tzinfo=get_autopublish_tz())
             if due > now:
                 continue
-            result = publish_preview_message(job["source_chat_id"], job["source_message_id"], job["genre"])
+            preview = job.get("preview") or {}
+            if not preview:
+                raise RuntimeError("Scheduled post has no saved preview payload; recreate the schedule")
+            result = publish_preview_payload(preview, job["genre"])
             job["status"] = "published"
             job["published_message_id"] = result.get("message_id")
             job["published_at"] = now.isoformat()
