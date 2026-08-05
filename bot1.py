@@ -1077,17 +1077,149 @@ def telegram_api_multipart(method: str, data: dict, files: dict) -> dict:
 
 
 def resolve_frame_path(genre: str) -> str:
+    """Find the PNG frame even if the repo folder is named slightly differently."""
     file_name = GENRE_FRAME_FILES.get(genre)
     if not file_name:
         return ""
-    candidates = [
-        os.path.join(GENRE_FRAME_DIR, file_name),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), GENRE_FRAME_DIR, file_name),
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    alt_names = [
+        file_name,
+        f"{genre}_frame.png",
+        f"{genre}.png",
     ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
+
+    dir_candidates = []
+    raw_dirs = [
+        GENRE_FRAME_DIR,
+        "genre_frames_ready",
+        "genre_frames",
+        os.path.join(script_dir, GENRE_FRAME_DIR),
+        os.path.join(script_dir, "genre_frames_ready"),
+        os.path.join(script_dir, "genre_frames"),
+    ]
+
+    for item in raw_dirs:
+        if not item:
+            continue
+        normalized = os.path.abspath(item) if not os.path.isabs(item) else item
+        if normalized not in dir_candidates:
+            dir_candidates.append(normalized)
+
+    # Support the case when GENRE_FRAME_DIR itself points directly to a file.
+    if os.path.isfile(GENRE_FRAME_DIR):
+        return GENRE_FRAME_DIR
+
+    for directory in dir_candidates:
+        for candidate_name in alt_names:
+            path = os.path.join(directory, candidate_name)
+            if os.path.isfile(path):
+                print("AUTOPUBLISH FRAME FOUND:", {"genre": genre, "path": path}, flush=True)
+                return path
+
+    print(
+        "AUTOPUBLISH FRAME SEARCH FAILED:",
+        {"genre": genre, "requested_dir": GENRE_FRAME_DIR, "checked_dirs": dir_candidates, "checked_names": alt_names},
+        flush=True,
+    )
     return ""
+
+
+def extract_cover_download_url(post: dict) -> str:
+    """Find the hyperlink attached to a line such as “скачать обложку”."""
+    text = get_post_text(post)
+    entities = post.get("entities") or post.get("caption_entities") or []
+
+    cursor = 0
+    for raw_line in text.splitlines(keepends=True):
+        visible = raw_line.rstrip("\r\n")
+        line_start = cursor
+        line_end = line_start + len(visible)
+        cursor += len(raw_line)
+
+        if "скачать облож" not in visible.casefold():
+            continue
+
+        # Prefer the URL embedded into the words “скачать обложку”.
+        for entity in entities:
+            try:
+                start = _utf16_to_py_index(text, int(entity.get("offset", 0)))
+                end = _utf16_to_py_index(
+                    text,
+                    int(entity.get("offset", 0)) + int(entity.get("length", 0)),
+                )
+            except Exception:
+                continue
+
+            if start < line_start or end > line_end:
+                continue
+
+            if entity.get("type") == "text_link" and entity.get("url"):
+                return str(entity["url"]).strip()
+            if entity.get("type") == "url":
+                return text[start:end].strip()
+
+        # Fallback when the URL is printed visibly on the same line.
+        match = re.search(r"https?://[^\s<>\]\)\"']+", visible)
+        if match:
+            return match.group(0).rstrip(".,;:!?")
+
+    return ""
+
+
+def _direct_download_url(url: str) -> str:
+    """Convert common Google Drive share links into direct-download links."""
+    value = (url or "").strip()
+    if not value:
+        return ""
+
+    match = re.search(r"drive\.google\.com/file/d/([^/]+)", value)
+    if match:
+        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
+
+    parsed = urlparse(value)
+    if "drive.google.com" in (parsed.netloc or "").lower():
+        params = dict(parse_qsl(parsed.query))
+        if params.get("id"):
+            return f"https://drive.google.com/uc?export=download&id={params['id']}"
+
+    return value
+
+
+def download_cover_from_url(url: str) -> str:
+    """Download an image from the cover hyperlink and validate it with Pillow."""
+    direct_url = _direct_download_url(url)
+    if not direct_url:
+        raise RuntimeError("Cover URL is empty")
+
+    response = requests.get(
+        direct_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; ChtoMusicBot/1.0)"},
+        timeout=DOWNLOAD_TIMEOUT,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+    suffix = mimetypes.guess_extension(content_type) or ".img"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(response.content)
+    tmp.flush()
+    tmp.close()
+
+    try:
+        with Image.open(tmp.name) as image:
+            image.verify()
+    except Exception:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Ссылка ‘скачать обложку’ не вернула изображение (Content-Type: {content_type or 'unknown'})"
+        )
+
+    return tmp.name
 
 
 def prepare_framed_cover(source_path: str, genre: str) -> str:
@@ -1099,8 +1231,15 @@ def prepare_framed_cover(source_path: str, genre: str) -> str:
     frame_path = resolve_frame_path(genre)
     if frame_path:
         with Image.open(frame_path) as frame_source:
-            frame = frame_source.convert("RGBA").resize((1280, 1280), Image.Resampling.LANCZOS)
+            frame = frame_source.convert("RGBA")
+            if frame.size != (1280, 1280):
+                frame = frame.resize((1280, 1280), Image.Resampling.LANCZOS)
             result = Image.alpha_composite(result, frame)
+            print(
+                "AUTOPUBLISH FRAME APPLIED:",
+                {"genre": genre, "frame_path": frame_path, "source_path": source_path},
+                flush=True,
+            )
     elif genre != "electronica":
         print("AUTOPUBLISH FRAME NOT FOUND:", {"genre": genre, "dir": GENRE_FRAME_DIR}, flush=True)
 
@@ -1125,29 +1264,201 @@ def author_emoji_html(author: str) -> str:
     return ""
 
 
+def _utf16_to_py_index(text: str, utf16_offset: int) -> int:
+    """Convert a Telegram UTF-16 entity offset to a Python string index."""
+    if utf16_offset <= 0:
+        return 0
+    units = 0
+    for index, char in enumerate(text):
+        char_units = len(char.encode("utf-16-le")) // 2
+        if units + char_units > utf16_offset:
+            return index
+        units += char_units
+        if units == utf16_offset:
+            return index + 1
+    return len(text)
+
+
+def _render_entity_line_html(text: str, entities: List[dict], line_start: int, line_end: int) -> str:
+    """Render one source line to Telegram HTML while preserving text links and formatting."""
+    line_text = text[line_start:line_end]
+    relevant = []
+
+    for entity in entities or []:
+        try:
+            entity_start = _utf16_to_py_index(text, int(entity.get("offset", 0)))
+            entity_end = _utf16_to_py_index(
+                text,
+                int(entity.get("offset", 0)) + int(entity.get("length", 0)),
+            )
+        except Exception:
+            continue
+
+        # Message entities normally do not span multiple lines. Ignore partial overlaps safely.
+        if entity_start < line_start or entity_end > line_end or entity_start >= entity_end:
+            continue
+
+        relevant.append({
+            **entity,
+            "start": entity_start - line_start,
+            "end": entity_end - line_start,
+        })
+
+    opens = {}
+    closes = {}
+
+    def tags_for(entity: dict):
+        etype = entity.get("type")
+        if etype == "bold":
+            return "<b>", "</b>"
+        if etype == "italic":
+            return "<i>", "</i>"
+        if etype == "underline":
+            return "<u>", "</u>"
+        if etype == "strikethrough":
+            return "<s>", "</s>"
+        if etype == "spoiler":
+            return '<span class="tg-spoiler">', "</span>"
+        if etype == "code":
+            return "<code>", "</code>"
+        if etype == "pre":
+            language = html_escape(entity.get("language") or "")
+            if language:
+                return f'<pre><code class="language-{language}">', "</code></pre>"
+            return "<pre>", "</pre>"
+        if etype == "text_link":
+            url = html_escape(entity.get("url") or "")
+            return (f'<a href="{url}">', "</a>") if url else ("", "")
+        if etype == "url":
+            visible = line_text[entity["start"]:entity["end"]]
+            url = html_escape(visible)
+            return f'<a href="{url}">', "</a>"
+        if etype == "custom_emoji":
+            emoji_id = html_escape(entity.get("custom_emoji_id") or "")
+            return (f'<tg-emoji emoji-id="{emoji_id}">', "</tg-emoji>") if emoji_id else ("", "")
+        return "", ""
+
+    for entity in relevant:
+        open_tag, close_tag = tags_for(entity)
+        if not open_tag:
+            continue
+        opens.setdefault(entity["start"], []).append((entity["end"], open_tag))
+        closes.setdefault(entity["end"], []).append((entity["start"], close_tag))
+
+    parts = []
+    for index in range(len(line_text) + 1):
+        # Close inner entities first.
+        for _, tag in sorted(closes.get(index, []), key=lambda item: item[0], reverse=True):
+            parts.append(tag)
+        # Open outer entities first.
+        for _, tag in sorted(opens.get(index, []), key=lambda item: item[0], reverse=True):
+            parts.append(tag)
+        if index < len(line_text):
+            parts.append(html_escape(line_text[index]))
+
+    return "".join(parts)
+
+
+def _clean_publish_lines(text: str):
+    """Return retained source lines; move public channel @mentions to the bottom."""
+    retained = []
+    bottom_mentions = []
+    cursor = 0
+
+    for raw_line in text.splitlines(keepends=True):
+        visible = raw_line.rstrip("\r\n")
+        start = cursor
+        end = start + len(visible)
+        cursor += len(raw_line)
+
+        stripped = visible.strip()
+        low = stripped.casefold()
+
+        if not stripped:
+            retained.append({"text": "", "start": start, "end": end})
+            continue
+
+        # Lines explicitly marked for deletion must never reach the channel.
+        if "удалить перед публикацией" in low:
+            continue
+
+        # A plain @channel line is public and must remain, but always at the bottom.
+        if low.startswith("@"):
+            bottom_mentions.append({"text": visible, "start": start, "end": end})
+            continue
+
+        # The cover-download control is used internally and removed from the caption.
+        if "скачать облож" in low:
+            continue
+
+        retained.append({"text": visible, "start": start, "end": end})
+
+    # Remove leading/trailing and repeated empty lines.
+    compact = []
+    for item in retained:
+        if not item["text"].strip():
+            if not compact or not compact[-1]["text"].strip():
+                continue
+        compact.append(item)
+    while compact and not compact[-1]["text"].strip():
+        compact.pop()
+
+    if bottom_mentions:
+        if compact and compact[-1]["text"].strip():
+            compact.append({"text": "", "start": 0, "end": 0})
+        compact.extend(bottom_mentions)
+
+    return compact
+
+
 def build_publish_caption(post: dict) -> str:
-    """Keep the editorial text and append the author's custom emoji to the author line."""
+    """
+    Build the ready-to-publish caption:
+    - preserve Telegram text hyperlinks and formatting;
+    - remove lines marked “удалить перед публикацией”;
+    - keep the public @channel mention and move it to the bottom;
+    - turn the first meaningful line after the title into a blockquote;
+    - append the mapped custom emoji to the author line.
+    """
     text = get_post_text(post)
+    entities = post.get("entities") or post.get("caption_entities") or []
     author = extract_author(text)
     emoji_html = author_emoji_html(author)
-    if not emoji_html:
-        return html_escape(text)[:1000]
+    lines = _clean_publish_lines(text)
 
-    escaped_lines = []
-    replaced = False
-    for line in text.splitlines():
-        escaped = html_escape(line)
-        if not replaced and re.match(r"^\s*Автор\s*[:\-–—]", line, flags=re.IGNORECASE):
-            escaped_lines.append(f"{escaped} {emoji_html}")
-            replaced = True
-        else:
-            escaped_lines.append(escaped)
+    meaningful_indexes = [i for i, item in enumerate(lines) if item["text"].strip()]
+    quote_index = meaningful_indexes[1] if len(meaningful_indexes) > 1 else None
 
-    if not replaced:
-        escaped_lines.extend(["", f"Автор: {html_escape(author)} {emoji_html}"])
+    rendered = []
+    author_replaced = False
 
-    return "\n".join(escaped_lines).strip()[:1000]
+    for index, item in enumerate(lines):
+        if not item["text"].strip():
+            if rendered and rendered[-1] != "":
+                rendered.append("")
+            continue
 
+        raw_line = item["text"]
+        line_html = _render_entity_line_html(text, entities, item["start"], item["end"])
+
+        if re.match(r"^\s*Автор\s*[:\-–—]", raw_line, flags=re.IGNORECASE):
+            if emoji_html:
+                line_html = f"{line_html} {emoji_html}"
+            author_replaced = True
+
+        if index == quote_index:
+            line_html = f"<blockquote>{line_html}</blockquote>"
+
+        rendered.append(line_html)
+
+    if author and emoji_html and not author_replaced:
+        if rendered and rendered[-1] != "":
+            rendered.append("")
+        rendered.append(f"Автор: {html_escape(author)} {emoji_html}")
+
+    caption = "\n".join(rendered).strip()
+    # Telegram photo captions are limited to 1024 characters after entity parsing.
+    return caption[:1000]
 
 def build_publish_buttons(genre: str) -> dict:
     return {
@@ -1173,7 +1484,7 @@ def should_build_publish_preview(post: dict) -> bool:
     genre = get_genre_from_thread(get_thread_id(post))
     if genre == "underground" or genre not in TARGET_CHANNELS:
         return False
-    if not extract_image_file_id(post):
+    if not extract_image_file_id(post) and not extract_cover_download_url(post):
         return False
     message_id = post.get("message_id")
     if not message_id:
@@ -1191,12 +1502,18 @@ def should_build_publish_preview(post: dict) -> bool:
 def send_publish_preview(post: dict):
     genre = get_genre_from_thread(get_thread_id(post))
     image_file_id = extract_image_file_id(post)
-    if not genre or not image_file_id:
+    cover_url = extract_cover_download_url(post)
+    if not genre or (not image_file_id and not cover_url):
         return
 
-    source_path = tg_download_file(image_file_id)
+    source_path = ""
     prepared_path = ""
     try:
+        if image_file_id:
+            source_path = tg_download_file(image_file_id)
+        else:
+            print("AUTOPUBLISH COVER DOWNLOAD:", {"genre": genre, "url": cover_url}, flush=True)
+            source_path = download_cover_from_url(cover_url)
         prepared_path = prepare_framed_cover(source_path, genre)
         caption = build_publish_caption(post)
         data = {
