@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V12: exact review/cover pairing; first-line quote; copy button removed.
+# V14: exact review/cover pairing; editorial paragraph spacing; copy button removed.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -1692,42 +1692,97 @@ def build_publish_caption(post: dict, genre: str = "") -> str:
 
     rendered = []
     author_replaced = False
+    previous_was_service_link = False
+
+    def ensure_blank_line():
+        if rendered and rendered[-1] != "":
+            rendered.append("")
+
+    def is_service_link_line(value: str) -> bool:
+        low = re.sub(r"\s+", " ", (value or "").strip()).casefold()
+        markers = (
+            "вконтакте",
+            "telegram",
+            "яндекс музыка",
+            "слушать везде",
+            "слушать на всех площадках",
+        )
+        return any(marker in low for marker in markers)
 
     for index, item in enumerate(lines):
         if not item["text"].strip():
-            if rendered and rendered[-1] != "":
-                rendered.append("")
+            ensure_blank_line()
+            previous_was_service_link = False
             continue
 
         raw_line = item["text"]
         line_html = _render_entity_line_html(text, entities, item["start"], item["end"])
+        is_title = index == title_index
+        is_quote = index == quote_index
+        is_liked = _line_is_liked_heading(raw_line)
+        is_author = bool(re.match(r"^\s*Автор\s*[:\-–—]", raw_line, flags=re.IGNORECASE))
+        is_mention = raw_line.strip().startswith("@")
+        is_service = is_service_link_line(raw_line)
 
-        if index == title_index:
+        # Match the editorial layout used in the channels:
+        # quote → blank → Artist — Track → blank → review paragraphs.
+        if is_title:
+            ensure_blank_line()
+
+        # Section boundaries should be visually separated even if the source
+        # message did not contain an empty line there.
+        if is_liked or is_author or is_mention:
+            ensure_blank_line()
+
+        # Service links are one compact block: blank before the first line,
+        # but no blank line between "ВКонтакте | Telegram" and
+        # "Яндекс Музыка | Слушать везде".
+        if is_service and not previous_was_service_link:
+            ensure_blank_line()
+
+        if is_title:
             disc = genre_emoji_html(genre)
             if disc and not raw_line.lstrip().startswith("💿"):
                 line_html = f"{disc} {line_html}"
 
-        if _line_is_liked_heading(raw_line):
+        if is_liked:
             marker = liked_section_emoji_html()
             if marker:
                 line_html = f"{marker} {line_html}"
 
-        if re.match(r"^\s*Автор\s*[:\-–—]", raw_line, flags=re.IGNORECASE):
+        if is_author:
             if emoji_html:
                 line_html = f"{emoji_html} {line_html}"
             author_replaced = True
 
-        if index == quote_index:
+        if is_quote:
             line_html = f"<blockquote>{line_html}</blockquote>"
 
         rendered.append(line_html)
 
-    if author and emoji_html and not author_replaced:
-        if rendered and rendered[-1] != "":
-            rendered.append("")
-        rendered.append(f"{emoji_html} Автор: {html_escape(author)}")
+        # Always leave breathing room after the quote/title/liked section/author.
+        if is_quote or is_title or is_liked or is_author:
+            ensure_blank_line()
 
-    return "\n".join(rendered).strip()[:3900]
+        previous_was_service_link = is_service
+
+    if author and emoji_html and not author_replaced:
+        ensure_blank_line()
+        rendered.append(f"{emoji_html} Автор: {html_escape(author)}")
+        ensure_blank_line()
+
+    # Avoid leading/trailing/multiple blank lines while keeping one empty line
+    # between editorial blocks and source paragraphs.
+    compact_rendered = []
+    for value in rendered:
+        if value == "":
+            if not compact_rendered or compact_rendered[-1] == "":
+                continue
+        compact_rendered.append(value)
+    while compact_rendered and compact_rendered[-1] == "":
+        compact_rendered.pop()
+
+    return "\n".join(compact_rendered).strip()[:3900]
 
 
 def _copy_signature(row_number: int, expires_at: int) -> str:
