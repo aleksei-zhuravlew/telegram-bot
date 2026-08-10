@@ -88,6 +88,10 @@ for _bot_id in AUTOPUBLISH_TRUSTED_BOT_IDS_RAW.split(","):
     if _bot_id:
         AUTOPUBLISH_TRUSTED_BOT_IDS.add(_bot_id)
 
+# ChtoMusicBot can send the review text and the cover as two consecutive messages.
+# Keep the latest parts briefly so the editorial draft is assembled from both.
+EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
+
 # Bot service messages are removed shortly before Telegram's 48-hour deletion limit.
 BOT_MESSAGE_CLEANUP_ENABLED = os.environ.get("BOT_MESSAGE_CLEANUP_ENABLED", "1") == "1"
 BOT_MESSAGE_CLEANUP_AFTER_MINUTES = int(os.environ.get("BOT_MESSAGE_CLEANUP_AFTER_MINUTES", str(47 * 60 + 40)))
@@ -153,6 +157,8 @@ scheduled_posts_lock = threading.Lock()
 autopublish_scheduler_started = False
 autopublish_scheduler_lock = threading.Lock()
 preview_dedup = {}
+editorial_draft_parts = {}
+editorial_draft_parts_lock = threading.Lock()
 cleanup_scheduler_started = False
 cleanup_scheduler_lock = threading.Lock()
 
@@ -924,7 +930,7 @@ def send_predlozhka_to_sheets(post: dict):
 
     yandex_link, common_link = extract_music_links_from_post(post)
     cover_file_id = extract_image_file_id(post) or ""
-    cover_url = extract_cover_download_url(post)
+    cover_url = extract_cover_download_url(post) or str(post.get("_editorial_cover_url") or "")
     post_type = infer_post_type(text)
     status = safe_status_for_predlozhka(post_type, yandex_link, common_link)
 
@@ -1699,6 +1705,173 @@ def build_draft_buttons(genre: str = "") -> dict:
 
 
 
+def _draft_parts_key(post: dict) -> str:
+    return f"{get_chat_id(post)}:{get_thread_id(post)}"
+
+
+def _is_trusted_editorial_sender(post: dict) -> bool:
+    sender = post.get("from") or {}
+    if not sender.get("is_bot"):
+        return True
+    return str(sender.get("id") or "") in AUTOPUBLISH_TRUSTED_BOT_IDS
+
+
+def _has_meaningful_publish_text(post: dict) -> bool:
+    text = get_post_text(post)
+    if not text:
+        return False
+    if infer_post_type(text) == "digest":
+        return False
+
+    try:
+        cleaned = _clean_publish_lines(text)
+    except Exception:
+        cleaned = [{"text": line} for line in text.splitlines()]
+
+    for item in cleaned:
+        value = str(item.get("text") or "").strip()
+        if not value:
+            continue
+        if value.startswith("#"):
+            continue
+        low = value.casefold()
+        if "скачать облож" in low or "удалить перед публикацией" in low:
+            continue
+        return True
+    return False
+
+
+def _post_has_cover_source(post: dict) -> bool:
+    return bool(extract_image_file_id(post) or extract_cover_download_url(post))
+
+
+def _prune_editorial_draft_parts(now_value: Optional[float] = None):
+    now_value = now_value or now_ts()
+    cutoff = now_value - EDITORIAL_DRAFT_PARTS_TTL_SEC
+    for key in [k for k, item in editorial_draft_parts.items() if float(item.get("updated_at") or 0) < cutoff]:
+        editorial_draft_parts.pop(key, None)
+
+
+def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
+    """Join a review-text message and a following/preceding cover message in one topic."""
+    if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
+        return post
+
+    genre = get_genre_from_thread(get_thread_id(post))
+    if genre == "underground" or genre not in TARGET_CHANNELS:
+        return post
+
+    # Digests are handled by the digest engine and must not be mixed with normal drafts.
+    if infer_post_type(get_post_text(post)) == "digest":
+        return post
+
+    key = _draft_parts_key(post)
+    now_value = now_ts()
+
+    with editorial_draft_parts_lock:
+        _prune_editorial_draft_parts(now_value)
+        entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
+
+        # Prefer an explicit reply as the text source when a cover message replies to the review.
+        replied = post.get("reply_to_message") or {}
+        if replied and _is_trusted_editorial_sender(replied) and _has_meaningful_publish_text(replied):
+            entry["text_post"] = replied
+
+        if _is_trusted_editorial_sender(post) and _has_meaningful_publish_text(post):
+            entry["text_post"] = post
+
+        # A cover may be sent by a helper bot. It is safe to cache it only inside
+        # the allow-listed Predlozhka chat/topic and combine it with trusted text.
+        if _post_has_cover_source(post):
+            entry["cover_post"] = post
+
+        entry["updated_at"] = now_value
+        text_post = entry.get("text_post")
+        cover_post = entry.get("cover_post")
+
+        if not text_post or not cover_post:
+            return post
+
+        combined = dict(cover_post)
+        combined["chat"] = post.get("chat") or cover_post.get("chat") or text_post.get("chat") or {}
+        combined["message_thread_id"] = get_thread_id(post) or get_thread_id(cover_post) or get_thread_id(text_post)
+        # The review sender is authoritative for trust checks.
+        combined["from"] = text_post.get("from") or cover_post.get("from") or {}
+
+        if text_post.get("text") is not None:
+            combined["text"] = text_post.get("text") or ""
+            combined["entities"] = text_post.get("entities") or []
+            combined.pop("caption", None)
+            combined.pop("caption_entities", None)
+        else:
+            combined["caption"] = text_post.get("caption") or ""
+            combined["caption_entities"] = text_post.get("caption_entities") or []
+            combined.pop("text", None)
+            combined.pop("entities", None)
+
+        cover_url = extract_cover_download_url(cover_post)
+        if cover_url:
+            combined["_editorial_cover_url"] = cover_url
+
+        text_mid = text_post.get("message_id") or ""
+        cover_mid = cover_post.get("message_id") or ""
+        combined["_editorial_source_message_id"] = text_mid
+        combined["_editorial_draft_key"] = f"{key}:{text_mid}:{cover_mid}"
+        return combined
+
+
+def _is_cover_service_only_message(post: dict) -> bool:
+    if not _post_has_cover_source(post):
+        return False
+    text = get_post_text(post)
+    if not text:
+        return True
+    try:
+        cleaned = _clean_publish_lines(text)
+        meaningful = [str(item.get("text") or "").strip() for item in cleaned if str(item.get("text") or "").strip()]
+        return not any(not value.startswith("#") for value in meaningful)
+    except Exception:
+        low = text.casefold()
+        return "скачать облож" in low and len(text.strip()) < 250
+
+
+def attach_cover_to_recent_sheet_row(post: dict) -> bool:
+    """Attach a standalone cover message to the latest Predlozhka row in the same topic."""
+    if not _is_cover_service_only_message(post):
+        return False
+    cover_file_id = extract_image_file_id(post) or ""
+    cover_url = extract_cover_download_url(post) or ""
+    if not cover_file_id and not cover_url:
+        return False
+    try:
+        resp = requests.post(
+            WEBHOOK_URL,
+            json={
+                "action": "attach_cover_to_recent",
+                "sheet": PREDLOZHKA_SHEET_NAME,
+                "chat_id": str(get_chat_id(post) or ""),
+                "thread_id": str(get_thread_id(post) or ""),
+                "cover_file_id": cover_file_id,
+                "cover_url": cover_url,
+                "cover_message_id": str(post.get("message_id") or ""),
+            },
+            timeout=60,
+        )
+        print("PREDLOZHKA COVER ATTACH:", resp.status_code, resp.text[:300], flush=True)
+        try:
+            data = resp.json()
+            if data.get("status") != "ok":
+                print("PREDLOZHKA COVER ATTACH NOT FOUND:", data, flush=True)
+        except Exception:
+            pass
+        # This is a service-only cover message; never append it as a separate review row.
+        return True
+    except Exception as e:
+        print("PREDLOZHKA COVER ATTACH ERROR:", str(e), flush=True)
+        # Still consume the service-only message so it cannot create a junk row.
+        return True
+
+
 def should_build_publish_preview(post: dict) -> bool:
     if not AUTOPUBLISH_PREVIEW_ENABLED:
         return False
@@ -1716,14 +1889,14 @@ def should_build_publish_preview(post: dict) -> bool:
     if infer_post_type(get_post_text(post)) == "digest":
         return False
 
-    if not extract_image_file_id(post) and not extract_cover_download_url(post):
+    if not extract_image_file_id(post) and not (extract_cover_download_url(post) or post.get("_editorial_cover_url")):
         return False
 
     message_id = post.get("message_id")
     if not message_id:
         return False
 
-    key = f"{get_chat_id(post)}:{message_id}"
+    key = str(post.get("_editorial_draft_key") or f"{get_chat_id(post)}:{message_id}")
     cutoff = now_ts() - PROCESSED_TTL_SEC
     for old_key in [k for k, ts in preview_dedup.items() if ts < cutoff]:
         preview_dedup.pop(old_key, None)
@@ -1784,7 +1957,7 @@ def _send_draft_photo(chat_id, thread_id, prepared_path: str, html_text: str, ge
 def send_publish_preview(post: dict):
     genre = get_genre_from_thread(get_thread_id(post))
     image_file_id = extract_image_file_id(post)
-    cover_url = extract_cover_download_url(post)
+    cover_url = extract_cover_download_url(post) or str(post.get("_editorial_cover_url") or "")
     if not genre or (not image_file_id and not cover_url):
         return
 
@@ -1798,6 +1971,13 @@ def send_publish_preview(post: dict):
             source_path = download_cover_from_url(cover_url)
         prepared_path = prepare_framed_cover(source_path, genre)
         caption = build_publish_caption(post, genre)
+        if not _strip_html_for_length(caption).strip():
+            print(
+                "EDITORIAL DRAFT WAITING FOR TEXT:",
+                {"genre": genre, "cover_message_id": post.get("message_id"), "source_message_id": post.get("_editorial_source_message_id")},
+                flush=True,
+            )
+            return
         result = _send_draft_photo(get_chat_id(post), get_thread_id(post), prepared_path, caption, genre)
         print(
             "EDITORIAL DRAFT SENT:",
@@ -3049,13 +3229,18 @@ def telegram_webhook():
             print("EDITORIAL MENU COMMAND ERROR:", str(e), flush=True)
 
         try:
-            send_predlozhka_to_sheets(incoming_message)
+            cover_attached = False
+            if is_allowed_predlozhka_chat(incoming_message) and is_allowed_predlozhka_thread(incoming_message):
+                cover_attached = attach_cover_to_recent_sheet_row(incoming_message)
+            if not cover_attached:
+                send_predlozhka_to_sheets(incoming_message)
         except Exception as e:
             print("MESSAGE HANDLER ERROR:", str(e), flush=True)
 
         try:
-            if should_build_publish_preview(incoming_message):
-                send_publish_preview(incoming_message)
+            draft_post = assemble_editorial_draft_post(incoming_message)
+            if should_build_publish_preview(draft_post):
+                send_publish_preview(draft_post)
         except Exception as e:
             print("AUTOPUBLISH PREVIEW ERROR:", str(e), flush=True)
 
