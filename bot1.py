@@ -2688,8 +2688,41 @@ def handle_draft_callback(callback: dict) -> bool:
 
 
 def _pending_title(raw_text: str) -> str:
-    title, _ = split_digest_post_text(raw_text or "")
-    return title or extract_digest_title(raw_text or "") or "Публикация"
+    """
+    Show a useful pending-list title: prefer the real "Artist — Track" line
+    instead of a teaser/quote or the generic "Публикация".
+    """
+    raw_text = raw_text or ""
+
+    try:
+        cleaned = _clean_publish_lines(raw_text)
+        candidates = [
+            str(item.get("text") or "").strip()
+            for item in cleaned
+            if str(item.get("text") or "").strip()
+        ]
+    except Exception:
+        candidates = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+    # First choice: an explicit release title like "Юля Шаврина - Сожги этот дом".
+    for line in candidates:
+        if _looks_like_release_title(line):
+            return re.sub(r"^💿\s*", "", line).strip()[:180]
+
+    # Fallback: use the first meaningful non-service line.
+    for line in candidates:
+        low = line.casefold()
+        if low.startswith("#"):
+            continue
+        if low.startswith("@"):
+            continue
+        if re.match(r"^автор\s*[:\-–—]", line, flags=re.IGNORECASE):
+            continue
+        if "скачать облож" in low or "удалить перед публикацией" in low:
+            continue
+        return re.sub(r"^💿\s*", "", line).strip()[:180]
+
+    return "Публикация"
 
 
 def build_pending_reviews_text(items: List[dict], requested_genre: str = "") -> str:
