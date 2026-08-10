@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V11: exact review/cover pairing; topic cache is never allowed to cross reviews.
+# V12: exact review/cover pairing; first-line quote; copy button removed.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -1659,7 +1659,7 @@ def _strip_html_for_length(value: str) -> str:
 
 def _line_is_liked_heading(value: str) -> bool:
     clean = re.sub(r"\s+", " ", (value or "").strip()).casefold()
-    return clean in {"что понравилось?", "что понравилось"}
+    return bool(re.match(r"^что понравилось\s*[?:]?(?:\s|$)", clean))
 
 
 def _looks_like_release_title(value: str) -> bool:
@@ -1686,15 +1686,9 @@ def build_publish_caption(post: dict, genre: str = "") -> str:
         None,
     )
 
-    # Quote the first semantic line after the release title. Legacy texts without
-    # a recognisable release title keep the first-line quote, but get no disc there.
-    quote_index = None
-    if title_index is not None:
-        following = [i for i in meaningful_indexes if i > title_index]
-        if following:
-            quote_index = following[0]
-    elif meaningful_indexes:
-        quote_index = meaningful_indexes[0]
+    # Editorial rule: the quote is ALWAYS the first meaningful retained line.
+    # The genre disc is independent and stays only on the Artist — Track line.
+    quote_index = meaningful_indexes[0] if meaningful_indexes else None
 
     rendered = []
     author_replaced = False
@@ -1759,23 +1753,9 @@ def _plain_publish_text(html_text: str) -> str:
 
 def build_draft_buttons(genre: str = "", html_text: str = "", row_number=None) -> dict:
     pending_data = f"pending:{genre}" if genre else "pending:all"
-    plain_text = _plain_publish_text(html_text) if html_text else ""
-
-    # Telegram's native clipboard button supports only 1-256 characters.
-    # For full reviews we link to a signed two-tap copy page on Render.
-    if plain_text and len(plain_text) <= 256:
-        copy_button = {"text": "📋 Копировать текст", "copy_text": {"text": plain_text}}
-    else:
-        copy_url = _build_copy_url(row_number)
-        if copy_url:
-            copy_button = {"text": "📋 Копировать текст", "url": copy_url}
-        else:
-            copy_button = {"text": "📋 Текст для копирования", "callback_data": "draft_copy"}
-
     return {
         "inline_keyboard": [
             [
-                copy_button,
                 {"text": "⬇️ Скачать обложку", "callback_data": "draft_cover"},
             ],
             [
@@ -2656,28 +2636,21 @@ def _draft_photo_message(message: dict) -> dict:
 
 def handle_draft_callback(callback: dict) -> bool:
     data = callback.get("data") or ""
-    if data not in ("draft_copy", "draft_cover"):
+    if data == "draft_copy":
+        # Compatibility for old draft messages created before V12.
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback.get("id"),
+            "text": "Кнопка копирования отключена",
+            "show_alert": False,
+        })
+        return True
+    if data != "draft_cover":
         return False
+
     callback_id = callback.get("id")
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
     thread_id = message.get("message_thread_id")
-
-    if data == "draft_copy":
-        text_value, entities = _message_text_and_entities(message)
-        if not text_value:
-            replied = message.get("reply_to_message") or {}
-            text_value, entities = _message_text_and_entities(replied)
-        if not text_value:
-            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Не нашёл текст в предпросмотре", "show_alert": True})
-            return True
-        payload = {"chat_id": chat_id, "text": text_value[:4096], "entities": entities, "disable_web_page_preview": True}
-        if thread_id:
-            payload["message_thread_id"] = thread_id
-        result = telegram_api_json("sendMessage", payload)
-        _schedule_result_cleanup(result)
-        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Текст отправлен отдельным сообщением — можно копировать", "show_alert": False})
-        return True
 
     photo_message = _draft_photo_message(message)
     photos = photo_message.get("photo") or []
@@ -3362,73 +3335,11 @@ def handle_review_callback(callback: dict):
 
 @app.get("/editorial-copy/<int:row_number>")
 def editorial_copy_page(row_number: int):
-    try:
-        expires_at = int(request.args.get("exp") or "0")
-    except Exception:
-        expires_at = 0
-    signature = str(request.args.get("sig") or "")
-    expected = _copy_signature(row_number, expires_at) if expires_at else ""
-    if not expires_at or int(time.time()) > expires_at or not hmac.compare_digest(signature, expected):
-        return Response("Ссылка для копирования недействительна или устарела.", status=403, content_type="text/plain; charset=utf-8")
-
-    try:
-        item = sheets_get("get_review", {"row": str(row_number)})
-    except Exception as e:
-        return Response(f"Не удалось получить текст: {e}", status=502, content_type="text/plain; charset=utf-8")
-
-    if item.get("status") != "ok":
-        return Response("Обзор не найден.", status=404, content_type="text/plain; charset=utf-8")
-
-    raw_text = str(item.get("title") or "")
-    genre = str(item.get("genre") or item.get("channel") or "")
-    synthetic = {
-        "text": raw_text,
-        "entities": _synthetic_text_link_entities(
-            raw_text,
-            str(item.get("yandex_link") or ""),
-            str(item.get("common_link") or ""),
-        ),
-    }
-    rich_html = build_publish_caption(synthetic, genre)
-    plain_text = _plain_publish_text(rich_html)
-
-    # JSON escaping is the safest way to embed arbitrary editorial text in JS.
-    rich_json = json.dumps(rich_html, ensure_ascii=False).replace("</", "<\\/")
-    plain_json = json.dumps(plain_text, ensure_ascii=False).replace("</", "<\\/")
-    page = f'''<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Копировать текст</title>
-<style>
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:20px;color:#111}}
-.card{{max-width:720px;margin:0 auto;background:#fff;border-radius:18px;padding:18px;box-shadow:0 6px 30px rgba(0,0,0,.08)}}
-button{{width:100%;border:0;border-radius:14px;padding:16px;font-size:17px;font-weight:700;background:#2481cc;color:#fff;cursor:pointer}}
-#status{{text-align:center;min-height:26px;margin:10px 0;color:#2481cc;font-weight:600}}
-.preview{{white-space:pre-wrap;line-height:1.45;border-top:1px solid #eee;padding-top:14px;word-break:break-word}}
-.preview blockquote{{border-left:3px solid #8b5cf6;margin:8px 0;padding-left:10px}}
-</style></head><body><div class="card">
-<button id="copy">📋 Скопировать весь текст</button><div id="status"></div><div class="preview">{rich_html}</div>
-</div><script>
-const rich={rich_json}; const plain={plain_json};
-async function copyAll(){{
-  const status=document.getElementById('status');
-  try{{
-    if(window.ClipboardItem && navigator.clipboard && navigator.clipboard.write){{
-      const item=new ClipboardItem({{'text/plain':new Blob([plain],{{type:'text/plain'}}),'text/html':new Blob([rich],{{type:'text/html'}})}});
-      await navigator.clipboard.write([item]);
-    }} else if(navigator.clipboard && navigator.clipboard.writeText){{
-      await navigator.clipboard.writeText(plain);
-    }} else {{ throw new Error('clipboard unavailable'); }}
-    status.textContent='✅ Текст скопирован в буфер';
-  }}catch(e){{
-    const ta=document.createElement('textarea'); ta.value=plain; document.body.appendChild(ta); ta.select();
-    try{{document.execCommand('copy'); status.textContent='✅ Текст скопирован в буфер';}}
-    catch(_){{status.textContent='Выдели текст ниже и скопируй вручную';}}
-    ta.remove();
-  }}
-}}
-document.getElementById('copy').addEventListener('click',copyAll);
-</script></body></html>'''
-    return Response(page, content_type="text/html; charset=utf-8")
+    return Response(
+        "Копирование текста отключено. Используй текст готового черновика прямо в Telegram.",
+        status=410,
+        content_type="text/plain; charset=utf-8",
+    )
 
 
 @app.get("/vk_auth")
