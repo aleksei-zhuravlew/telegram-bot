@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V14: exact review/cover pairing; editorial paragraph spacing; copy button removed.
+# V15: V14 formatting + custom author emoji for the full editorial team.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -157,6 +157,7 @@ LIKED_SECTION_EMOJI = {
 }
 
 AUTHOR_EMOJI_MAP = {
+    # Алексей
     "Алексей Журавлев": {
         "emoji_id": "5429396071589642872",
         "visible": "😎",
@@ -164,6 +165,40 @@ AUTHOR_EMOJI_MAP = {
     "Журавлев Алексей": {
         "emoji_id": "5429396071589642872",
         "visible": "😎",
+    },
+
+    # Редакция
+    "Нина Большакова": {
+        "emoji_id": "5219832642848986907",
+        "visible": "🙂",
+    },
+    "Ярослав Прохорычев": {
+        "emoji_id": "5321516513272834768",
+        "visible": "🙂",
+    },
+    "YuraKostin": {
+        "emoji_id": "5431444126744744292",
+        "visible": "🙂",
+    },
+    "Максим Ушаков": {
+        "emoji_id": "5190431817886374745",
+        "visible": "🙂",
+    },
+    "Вера Чистякова": {
+        "emoji_id": "5433845133722291311",
+        "visible": "🙂",
+    },
+    "Костя Шалтай": {
+        "emoji_id": "5303267416275456779",
+        "visible": "🙂",
+    },
+    "AndrrrRock": {
+        "emoji_id": "5429116615247561210",
+        "visible": "🙂",
+    },
+    "Павел Кофф": {
+        "emoji_id": "5431670364147057531",
+        "visible": "🙂",
     },
 }
 
@@ -1474,7 +1509,14 @@ def prepare_framed_cover(source_path: str, genre: str) -> str:
 
 
 def normalize_author_name(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+    """
+    Normalize editor signatures for reliable custom-emoji matching.
+    Tolerates Telegram/Markdown-style emphasis markers and extra spacing.
+    """
+    value = (value or "").strip()
+    value = re.sub(r"^[*_~`\s]+|[*_~`\s]+$", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.casefold()
 
 
 def author_emoji_html(author: str) -> str:
