@@ -88,7 +88,17 @@ for _bot_id in AUTOPUBLISH_TRUSTED_BOT_IDS_RAW.split(","):
     if _bot_id:
         AUTOPUBLISH_TRUSTED_BOT_IDS.add(_bot_id)
 
-# ChtoMusicBot can send the review text and the cover as two consecutive messages.
+print(
+    "EDITORIAL DRAFT CONFIG:",
+    {
+        "preview_enabled": AUTOPUBLISH_PREVIEW_ENABLED,
+        "channel_publish_enabled": AUTOPUBLISH_CHANNEL_ENABLED,
+        "trusted_bot_ids": sorted(AUTOPUBLISH_TRUSTED_BOT_IDS),
+    },
+    flush=True,
+)
+
+# V10: ChtoMusicBot can send the review text and the cover as two consecutive messages.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -962,6 +972,18 @@ def send_predlozhka_to_sheets(post: dict):
     try:
         resp = requests.post(WEBHOOK_URL, json=data, timeout=60)
         print("PREDLOZHKA SHEETS OK:", resp.status_code, resp.text[:300], flush=True)
+        try:
+            payload = resp.json()
+            row_number = payload.get("row")
+            if row_number:
+                post["_editorial_sheet_row"] = int(row_number)
+                print(
+                    "EDITORIAL SHEET ROW LINKED:",
+                    {"row": row_number, "message_id": message_id, "genre": genre},
+                    flush=True,
+                )
+        except Exception as parse_error:
+            print("EDITORIAL SHEET ROW PARSE ERROR:", str(parse_error), flush=True)
     except Exception as e:
         print("PREDLOZHKA SHEETS ERROR:", str(e), flush=True)
 
@@ -1752,8 +1774,102 @@ def _prune_editorial_draft_parts(now_value: Optional[float] = None):
         editorial_draft_parts.pop(key, None)
 
 
+def _utf16_units(value: str) -> int:
+    return len((value or "").encode("utf-16-le")) // 2
+
+
+def _synthetic_text_link_entities(text: str, yandex_link: str = "", common_link: str = "") -> List[dict]:
+    """Rebuild the two editorial music links when a draft has to be recovered from Sheets."""
+    entities: List[dict] = []
+    targets = [
+        ("Яндекс Музыка", first_link(yandex_link)),
+        ("Слушать везде", first_link(common_link)),
+    ]
+    low = (text or "").casefold()
+    used = set()
+    for label, url in targets:
+        if not url:
+            continue
+        start = low.find(label.casefold())
+        if start < 0:
+            continue
+        key = (start, label)
+        if key in used:
+            continue
+        used.add(key)
+        entities.append({
+            "type": "text_link",
+            "offset": _utf16_units(text[:start]),
+            "length": _utf16_units(text[start:start + len(label)]),
+            "url": url,
+        })
+    return entities
+
+
+def _recover_draft_parts_from_sheet(row_number, current_post: dict):
+    """Recover review text/cover from the authoritative Predlozhka row after restart or out-of-order updates."""
+    if not row_number:
+        return None, None
+    try:
+        item = sheets_get("get_review", {"row": str(row_number)})
+    except Exception as e:
+        print("EDITORIAL SHEET RECOVERY ERROR:", {"row": row_number, "error": str(e)}, flush=True)
+        return None, None
+
+    if item.get("status") != "ok":
+        print("EDITORIAL SHEET RECOVERY SKIP:", {"row": row_number, "response": item}, flush=True)
+        return None, None
+
+    raw_text = str(item.get("title") or "").strip()
+    text_post = None
+    if raw_text and infer_post_type(raw_text) != "digest":
+        text_post = {
+            "message_id": item.get("message_id") or current_post.get("message_id"),
+            "chat": current_post.get("chat") or {"id": item.get("chat_id")},
+            "message_thread_id": current_post.get("message_thread_id") or item.get("thread_id"),
+            "from": current_post.get("from") or {},
+            "text": raw_text,
+            "entities": _synthetic_text_link_entities(
+                raw_text,
+                str(item.get("yandex_link") or ""),
+                str(item.get("common_link") or ""),
+            ),
+            "_editorial_sheet_row": row_number,
+        }
+
+    cover_file_id = str(item.get("cover_file_id") or "").strip()
+    cover_url = str(item.get("cover_url") or "").strip()
+    cover_post = None
+    if cover_file_id or cover_url:
+        cover_post = {
+            "message_id": current_post.get("message_id"),
+            "chat": current_post.get("chat") or {"id": item.get("chat_id")},
+            "message_thread_id": current_post.get("message_thread_id") or item.get("thread_id"),
+            "from": current_post.get("from") or {},
+            "text": "",
+            "_editorial_sheet_row": row_number,
+        }
+        if cover_file_id:
+            cover_post["photo"] = [{"file_id": cover_file_id}]
+        if cover_url:
+            cover_post["_editorial_cover_url"] = cover_url
+
+    print(
+        "EDITORIAL SHEET RECOVERY:",
+        {
+            "row": row_number,
+            "has_text": bool(text_post),
+            "has_cover": bool(cover_post),
+            "cover_file": bool(cover_file_id),
+            "cover_url": bool(cover_url),
+        },
+        flush=True,
+    )
+    return text_post, cover_post
+
+
 def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
-    """Join a review-text message and a following/preceding cover message in one topic."""
+    """Join review text + cover, with Google Sheets as a persistent fallback."""
     if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
         return post
 
@@ -1761,18 +1877,18 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
     if genre == "underground" or genre not in TARGET_CHANNELS:
         return post
 
-    # Digests are handled by the digest engine and must not be mixed with normal drafts.
+    # #сверхновые are handled only by the digest engine.
     if infer_post_type(get_post_text(post)) == "digest":
         return post
 
     key = _draft_parts_key(post)
     now_value = now_ts()
+    row_number = post.get("_editorial_sheet_row")
 
     with editorial_draft_parts_lock:
         _prune_editorial_draft_parts(now_value)
         entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
 
-        # Prefer an explicit reply as the text source when a cover message replies to the review.
         replied = post.get("reply_to_message") or {}
         if replied and _is_trusted_editorial_sender(replied) and _has_meaningful_publish_text(replied):
             entry["text_post"] = replied
@@ -1780,45 +1896,81 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
         if _is_trusted_editorial_sender(post) and _has_meaningful_publish_text(post):
             entry["text_post"] = post
 
-        # A cover may be sent by a helper bot. It is safe to cache it only inside
-        # the allow-listed Predlozhka chat/topic and combine it with trusted text.
-        if _post_has_cover_source(post):
+        if _post_has_cover_source(post) or post.get("_editorial_cover_url"):
             entry["cover_post"] = post
+
+        if row_number:
+            entry["sheet_row"] = row_number
 
         entry["updated_at"] = now_value
         text_post = entry.get("text_post")
         cover_post = entry.get("cover_post")
+        row_number = entry.get("sheet_row") or row_number
 
-        if not text_post or not cover_post:
-            return post
+        print(
+            "EDITORIAL DRAFT PARTS:",
+            {
+                "key": key,
+                "genre": genre,
+                "incoming_message_id": post.get("message_id"),
+                "sheet_row": row_number,
+                "has_text": bool(text_post),
+                "has_cover": bool(cover_post),
+                "incoming_has_text": _has_meaningful_publish_text(post),
+                "incoming_has_cover": bool(_post_has_cover_source(post) or post.get("_editorial_cover_url")),
+                "sender_id": (post.get("from") or {}).get("id"),
+            },
+            flush=True,
+        )
 
-        combined = dict(cover_post)
-        combined["chat"] = post.get("chat") or cover_post.get("chat") or text_post.get("chat") or {}
-        combined["message_thread_id"] = get_thread_id(post) or get_thread_id(cover_post) or get_thread_id(text_post)
-        # The review sender is authoritative for trust checks.
-        combined["from"] = text_post.get("from") or cover_post.get("from") or {}
+    # Do the network fallback outside the lock.
+    if row_number and (not text_post or not cover_post):
+        recovered_text, recovered_cover = _recover_draft_parts_from_sheet(row_number, post)
+        with editorial_draft_parts_lock:
+            entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
+            if not entry.get("text_post") and recovered_text:
+                entry["text_post"] = recovered_text
+            if not entry.get("cover_post") and recovered_cover:
+                entry["cover_post"] = recovered_cover
+            entry["sheet_row"] = row_number
+            entry["updated_at"] = now_ts()
+            text_post = entry.get("text_post")
+            cover_post = entry.get("cover_post")
 
-        if text_post.get("text") is not None:
-            combined["text"] = text_post.get("text") or ""
-            combined["entities"] = text_post.get("entities") or []
-            combined.pop("caption", None)
-            combined.pop("caption_entities", None)
-        else:
-            combined["caption"] = text_post.get("caption") or ""
-            combined["caption_entities"] = text_post.get("caption_entities") or []
-            combined.pop("text", None)
-            combined.pop("entities", None)
+    if not text_post or not cover_post:
+        print(
+            "EDITORIAL DRAFT WAITING FOR PART:",
+            {"key": key, "genre": genre, "sheet_row": row_number, "has_text": bool(text_post), "has_cover": bool(cover_post)},
+            flush=True,
+        )
+        return post
 
-        cover_url = extract_cover_download_url(cover_post)
-        if cover_url:
-            combined["_editorial_cover_url"] = cover_url
+    combined = dict(cover_post)
+    combined["chat"] = post.get("chat") or cover_post.get("chat") or text_post.get("chat") or {}
+    combined["message_thread_id"] = get_thread_id(post) or get_thread_id(cover_post) or get_thread_id(text_post)
+    combined["from"] = text_post.get("from") or cover_post.get("from") or {}
 
-        text_mid = text_post.get("message_id") or ""
-        cover_mid = cover_post.get("message_id") or ""
-        combined["_editorial_source_message_id"] = text_mid
-        combined["_editorial_draft_key"] = f"{key}:{text_mid}:{cover_mid}"
-        return combined
+    if text_post.get("text") is not None:
+        combined["text"] = text_post.get("text") or ""
+        combined["entities"] = text_post.get("entities") or []
+        combined.pop("caption", None)
+        combined.pop("caption_entities", None)
+    else:
+        combined["caption"] = text_post.get("caption") or ""
+        combined["caption_entities"] = text_post.get("caption_entities") or []
+        combined.pop("text", None)
+        combined.pop("entities", None)
 
+    cover_url = extract_cover_download_url(cover_post) or str(cover_post.get("_editorial_cover_url") or "")
+    if cover_url:
+        combined["_editorial_cover_url"] = cover_url
+
+    text_mid = text_post.get("message_id") or ""
+    cover_mid = cover_post.get("message_id") or ""
+    combined["_editorial_source_message_id"] = text_mid
+    combined["_editorial_sheet_row"] = row_number or text_post.get("_editorial_sheet_row") or cover_post.get("_editorial_sheet_row")
+    combined["_editorial_draft_key"] = f"{key}:{text_mid}:{cover_mid}:{combined.get('_editorial_sheet_row') or ''}"
+    return combined
 
 def _is_cover_service_only_message(post: dict) -> bool:
     if not _post_has_cover_source(post):
@@ -1860,10 +2012,17 @@ def attach_cover_to_recent_sheet_row(post: dict) -> bool:
         print("PREDLOZHKA COVER ATTACH:", resp.status_code, resp.text[:300], flush=True)
         try:
             data = resp.json()
-            if data.get("status") != "ok":
+            if data.get("status") == "ok" and data.get("row"):
+                post["_editorial_sheet_row"] = int(data.get("row"))
+                print(
+                    "EDITORIAL COVER ROW LINKED:",
+                    {"row": data.get("row"), "message_id": post.get("message_id")},
+                    flush=True,
+                )
+            else:
                 print("PREDLOZHKA COVER ATTACH NOT FOUND:", data, flush=True)
-        except Exception:
-            pass
+        except Exception as parse_error:
+            print("PREDLOZHKA COVER ATTACH PARSE ERROR:", str(parse_error), flush=True)
         # This is a service-only cover message; never append it as a separate review row.
         return True
     except Exception as e:
@@ -1958,7 +2117,21 @@ def send_publish_preview(post: dict):
     genre = get_genre_from_thread(get_thread_id(post))
     image_file_id = extract_image_file_id(post)
     cover_url = extract_cover_download_url(post) or str(post.get("_editorial_cover_url") or "")
+    print(
+        "EDITORIAL PREVIEW START:",
+        {
+            "genre": genre,
+            "message_id": post.get("message_id"),
+            "source_message_id": post.get("_editorial_source_message_id"),
+            "sheet_row": post.get("_editorial_sheet_row"),
+            "has_file_id": bool(image_file_id),
+            "has_cover_url": bool(cover_url),
+            "text_len": len(get_post_text(post)),
+        },
+        flush=True,
+    )
     if not genre or (not image_file_id and not cover_url):
+        print("EDITORIAL PREVIEW SKIP: missing genre/cover", flush=True)
         return
 
     source_path = ""
