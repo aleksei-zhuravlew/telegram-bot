@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V15: V14 formatting + custom author emoji for the full editorial team.
+# V18: V17 + cover-first pairing + invalid PuzzleBot template URL rejection.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -1381,8 +1381,39 @@ def resolve_frame_path(genre: str) -> str:
     )
     return ""
 
+def _is_usable_cover_url(value: str) -> bool:
+    """
+    Reject unresolved bot/template URLs such as [[url_обложка]], {{cover}},
+    including URL-encoded forms. They are not real cover links.
+    """
+    value = (value or "").strip()
+    if not value:
+        return False
+
+    try:
+        decoded = unquote(value)
+    except Exception:
+        decoded = value
+
+    low = decoded.casefold()
+    placeholder_markers = (
+        "[[",
+        "]]",
+        "{{",
+        "}}",
+        "url_облож",
+        "url облож",
+        "cover_url",
+        "cover url",
+    )
+    if any(marker in low for marker in placeholder_markers):
+        return False
+
+    return low.startswith("http://") or low.startswith("https://")
+
+
 def extract_cover_download_url(post: dict) -> str:
-    """Find the hyperlink attached to a line such as “скачать обложку”."""
+    """Find a REAL hyperlink attached to a line such as “скачать обложку”."""
     text = get_post_text(post)
     entities = post.get("entities") or post.get("caption_entities") or []
 
@@ -1411,14 +1442,20 @@ def extract_cover_download_url(post: dict) -> str:
                 continue
 
             if entity.get("type") == "text_link" and entity.get("url"):
-                return str(entity["url"]).strip()
+                candidate = str(entity["url"]).strip()
+                if _is_usable_cover_url(candidate):
+                    return candidate
             if entity.get("type") == "url":
-                return text[start:end].strip()
+                candidate = text[start:end].strip()
+                if _is_usable_cover_url(candidate):
+                    return candidate
 
         # Fallback when the URL is printed visibly on the same line.
         match = re.search(r"https?://[^\s<>\]\)\"']+", visible)
         if match:
-            return match.group(0).rstrip(".,;:!?")
+            candidate = match.group(0).rstrip(".,;:!?")
+            if _is_usable_cover_url(candidate):
+                return candidate
 
     return ""
 
@@ -2035,16 +2072,56 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
         print("EDITORIAL DRAFT EXACT MESSAGE:", {"key": key, "row": row_number, "message_id": post.get("message_id")}, flush=True)
         return direct
 
-    # Every new meaningful review text starts a fresh pairing slot for this topic.
-    # This is the key V11 fix: an old review can never remain as text for a new cover.
+    # Pairing supports BOTH delivery orders:
+    #   text -> cover
+    #   cover -> text
+    # while still refusing to reuse an old unrelated cover.
     with editorial_draft_parts_lock:
         _prune_editorial_draft_parts(now_value)
+
         if incoming_text:
+            previous = editorial_draft_parts.get(key) or {}
+            previous_cover = previous.get("cover_post")
+            keep_previous_cover = False
+
+            if previous_cover:
+                try:
+                    cover_mid = int(previous_cover.get("message_id") or 0)
+                    text_mid = int(post.get("message_id") or 0)
+                except Exception:
+                    cover_mid = 0
+                    text_mid = 0
+
+                age_sec = now_value - float(previous.get("updated_at") or 0)
+
+                # A standalone image sent immediately BEFORE its review text is
+                # considered the same review. Restrict by time + message distance
+                # so an old cover can never leak into a later review.
+                keep_previous_cover = (
+                    0 <= age_sec <= 300
+                    and cover_mid > 0
+                    and text_mid > cover_mid
+                    and (text_mid - cover_mid) <= 3
+                )
+
             entry = {
                 "updated_at": now_value,
                 "text_post": post,
                 "sheet_row": row_number,
             }
+            if keep_previous_cover:
+                entry["cover_post"] = previous_cover
+                print(
+                    "EDITORIAL COVER-FIRST PAIR:",
+                    {
+                        "key": key,
+                        "cover_message_id": previous_cover.get("message_id"),
+                        "text_message_id": post.get("message_id"),
+                        "age_sec": round(age_sec, 2),
+                    },
+                    flush=True,
+                )
+
             editorial_draft_parts[key] = entry
         else:
             entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
@@ -2836,9 +2913,12 @@ def build_pending_reviews_text(items: List[dict], requested_genre: str = "") -> 
     for genre in keys:
         parts.append(f"<b>{html_escape(genre_label(genre))} — {len(grouped[genre])}</b>")
         for item in grouped[genre]:
-            title = html_escape(_pending_title(item.get("title") or ""))
+            raw_title = item.get("display_title") or item.get("title") or ""
+            title = html_escape(_pending_title(raw_title))
             link = item.get("link") or item.get("common_link") or item.get("yandex_link") or ""
-            parts.append(f'• <a href="{html_escape(first_link(link))}">{title}</a>' if link else f"• {title}")
+            age = str(item.get("age_display") or "").strip()
+            age_suffix = f" — ⏱ {html_escape(age)}" if age else ""
+            parts.append(f'• <a href="{html_escape(first_link(link))}">{title}</a>{age_suffix}' if link else f"• {title}{age_suffix}")
         parts.append("")
     value = "\n".join(parts).strip()
     if len(_strip_html_for_length(value)) <= 3900:
