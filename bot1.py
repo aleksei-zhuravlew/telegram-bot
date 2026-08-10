@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V18: V17 + cover-first pairing + invalid PuzzleBot template URL rejection.
+# V19: V18 + robust pending title extraction.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -2913,8 +2913,11 @@ def build_pending_reviews_text(items: List[dict], requested_genre: str = "") -> 
     for genre in keys:
         parts.append(f"<b>{html_escape(genre_label(genre))} — {len(grouped[genre])}</b>")
         for item in grouped[genre]:
-            raw_title = item.get("display_title") or item.get("title") or ""
-            title = html_escape(_pending_title(raw_title))
+            display_title = str(item.get("display_title") or "").strip()
+            if display_title and display_title.casefold() != "публикация":
+                title = html_escape(display_title)
+            else:
+                title = html_escape(_pending_title(item.get("title") or ""))
             link = item.get("link") or item.get("common_link") or item.get("yandex_link") or ""
             age = str(item.get("age_display") or "").strip()
             age_suffix = f" — ⏱ {html_escape(age)}" if age else ""
