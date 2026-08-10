@@ -100,6 +100,10 @@ AUTHOR_EMOJI_MAP = {
     },
 }
 
+# Custom emoji pack used by the editorial team.
+# Telegram link: https://t.me/addemoji/ChtoMusicTeam
+CUSTOM_EMOJI_PACK_NAME = os.environ.get("CUSTOM_EMOJI_PACK_NAME", "ChtoMusicTeam").strip() or "ChtoMusicTeam"
+
 # In-memory state for the short dialogue after pressing “Опубликовать позже”.
 # Scheduled jobs themselves are also saved to AUTOPUBLISH_STORE_PATH.
 awaiting_schedule = {}
@@ -650,6 +654,130 @@ def debug_custom_emoji_entities(post: dict):
             },
             flush=True,
         )
+
+
+def _send_emojipack_lines(chat_id, lines: List[str], thread_id=None):
+    """Send HTML lines in safe Telegram-sized chunks."""
+    chunks = []
+    current = []
+    current_len = 0
+
+    for line in lines:
+        extra = len(line) + (1 if current else 0)
+        if current and current_len + extra > 3400:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += extra
+
+    if current:
+        chunks.append("\n".join(current))
+
+    for chunk in chunks:
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if thread_id:
+            try:
+                payload["message_thread_id"] = int(thread_id)
+            except Exception:
+                pass
+        telegram_api_json("sendMessage", payload)
+
+
+def handle_emojipack_command(post: dict) -> bool:
+    """
+    /emojipack [pack_name]
+
+    Loads the custom emoji sticker set through Bot API getStickerSet and
+    prints every custom_emoji_id. Each row also embeds the corresponding
+    custom emoji so the editor can visually match an ID to the icon.
+    """
+    text = get_post_text(post).strip()
+    if not text:
+        return False
+
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@", 1)[0].casefold()
+    if command != "/emojipack":
+        return False
+
+    chat_id = get_chat_id(post)
+    if not chat_id:
+        return True
+
+    pack_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else CUSTOM_EMOJI_PACK_NAME
+    thread_id = get_thread_id(post)
+
+    try:
+        sticker_set = telegram_api("getStickerSet", {"name": pack_name})
+        stickers = sticker_set.get("stickers") or []
+
+        rows = []
+        for index, sticker in enumerate(stickers, start=1):
+            custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
+            if not custom_emoji_id:
+                continue
+
+            visible = str(sticker.get("emoji") or "🙂")
+            safe_visible = html_escape(visible)
+            rows.append(
+                f'{index}. <tg-emoji emoji-id="{html_escape(custom_emoji_id)}">{safe_visible}</tg-emoji> '
+                f'<code>{html_escape(custom_emoji_id)}</code>'
+            )
+
+            print(
+                "EMOJI PACK ITEM:",
+                {
+                    "pack": pack_name,
+                    "index": index,
+                    "emoji": visible,
+                    "custom_emoji_id": custom_emoji_id,
+                },
+                flush=True,
+            )
+
+        title = sticker_set.get("title") or pack_name
+        header = [
+            f"<b>Набор:</b> {html_escape(title)}",
+            f"<b>Имя:</b> <code>{html_escape(pack_name)}</code>",
+            f"<b>Найдено custom emoji:</b> {len(rows)}",
+            "",
+        ]
+
+        if not rows:
+            header.append("В этом наборе Bot API не вернул custom_emoji_id.")
+
+        _send_emojipack_lines(chat_id, header + rows, thread_id)
+        print(
+            "EMOJI PACK LOADED:",
+            {"pack": pack_name, "title": title, "count": len(rows)},
+            flush=True,
+        )
+    except Exception as e:
+        print("EMOJI PACK ERROR:", {"pack": pack_name, "error": str(e)}, flush=True)
+        payload = {
+            "chat_id": chat_id,
+            "text": (
+                "❌ Не удалось получить набор custom emoji.\n"
+                f"Pack: <code>{html_escape(pack_name)}</code>\n"
+                f"Ошибка: <code>{html_escape(str(e))}</code>"
+            ),
+            "parse_mode": "HTML",
+        }
+        if thread_id:
+            try:
+                payload["message_thread_id"] = int(thread_id)
+            except Exception:
+                pass
+        telegram_api_json("sendMessage", payload)
+
+    return True
 
 
 def debug_thread_info(post: dict, source: str):
@@ -2532,6 +2660,12 @@ def telegram_webhook():
             debug_custom_emoji_entities(incoming_message)
         except Exception as e:
             print("CUSTOM EMOJI DEBUG ERROR:", str(e), flush=True)
+
+        try:
+            if handle_emojipack_command(incoming_message):
+                return "ok", 200
+        except Exception as e:
+            print("EMOJI PACK COMMAND ERROR:", str(e), flush=True)
 
         try:
             if handle_schedule_time_message(incoming_message):
