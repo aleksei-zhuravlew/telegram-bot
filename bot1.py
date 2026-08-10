@@ -5,6 +5,8 @@ import time
 import mimetypes
 import tempfile
 import threading
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
@@ -13,7 +15,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 import requests
 from PIL import Image, ImageOps
 from html import unescape
-from flask import Flask, request
+from flask import Flask, request, Response
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # Apps Script URL
@@ -74,6 +76,15 @@ AUTOPUBLISH_CHECK_INTERVAL_SEC = int(os.environ.get("AUTOPUBLISH_CHECK_INTERVAL_
 AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")  # legacy fallback; Sheets is used for new schedules
 GENRE_FRAME_DIR = os.environ.get("GENRE_FRAME_DIR", "genre_frames")
 
+# Telegram native copy_text is limited to 256 characters. Long editorial reviews
+# use a signed copy page hosted by this same Render web service.
+EDITORIAL_COPY_BASE_URL = (
+    os.environ.get("EDITORIAL_COPY_BASE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or ""
+).rstrip("/")
+EDITORIAL_COPY_LINK_TTL_SEC = int(os.environ.get("EDITORIAL_COPY_LINK_TTL_SEC", str(2 * 24 * 60 * 60)))
+
 # Channel publishing is intentionally paused. The bot only prepares editorial drafts.
 AUTOPUBLISH_CHANNEL_ENABLED = os.environ.get("AUTOPUBLISH_CHANNEL_ENABLED", "0") == "1"
 
@@ -98,7 +109,7 @@ print(
     flush=True,
 )
 
-# V10: ChtoMusicBot can send the review text and the cover as two consecutive messages.
+# V11: exact review/cover pairing; topic cache is never allowed to cross reviews.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -1651,6 +1662,13 @@ def _line_is_liked_heading(value: str) -> bool:
     return clean in {"что понравилось?", "что понравилось"}
 
 
+def _looks_like_release_title(value: str) -> bool:
+    clean = re.sub(r"\s+", " ", (value or "").strip())
+    if not clean:
+        return False
+    return bool(re.search(r"\S\s+[—–-]\s+\S", clean))
+
+
 def build_publish_caption(post: dict, genre: str = "") -> str:
     """Build a ready editorial draft while preserving source formatting and links."""
     text = get_post_text(post)
@@ -1660,19 +1678,26 @@ def build_publish_caption(post: dict, genre: str = "") -> str:
     lines = _clean_publish_lines(text)
 
     meaningful_indexes = [i for i, item in enumerate(lines) if item["text"].strip()]
+
+    # The genre disc belongs ONLY to the Artist — Track line. It must never be
+    # inserted into a quote just because the first semantic line is a teaser.
+    title_index = next(
+        (i for i in meaningful_indexes if _looks_like_release_title(lines[i]["text"])),
+        None,
+    )
+
+    # Quote the first semantic line after the release title. Legacy texts without
+    # a recognisable release title keep the first-line quote, but get no disc there.
     quote_index = None
-    if meaningful_indexes:
-        first_index = meaningful_indexes[0]
-        first_line = lines[first_index]["text"].strip()
-        looks_like_title = bool(re.search(r"\S\s+[—–-]\s+\S", first_line))
-        if looks_like_title and len(meaningful_indexes) > 1:
-            quote_index = meaningful_indexes[1]
-        else:
-            quote_index = first_index
+    if title_index is not None:
+        following = [i for i in meaningful_indexes if i > title_index]
+        if following:
+            quote_index = following[0]
+    elif meaningful_indexes:
+        quote_index = meaningful_indexes[0]
 
     rendered = []
     author_replaced = False
-    first_meaningful = meaningful_indexes[0] if meaningful_indexes else None
 
     for index, item in enumerate(lines):
         if not item["text"].strip():
@@ -1683,7 +1708,7 @@ def build_publish_caption(post: dict, genre: str = "") -> str:
         raw_line = item["text"]
         line_html = _render_entity_line_html(text, entities, item["start"], item["end"])
 
-        if index == first_meaningful:
+        if index == title_index:
             disc = genre_emoji_html(genre)
             if disc and not raw_line.lstrip().startswith("💿"):
                 line_html = f"{disc} {line_html}"
@@ -1711,12 +1736,46 @@ def build_publish_caption(post: dict, genre: str = "") -> str:
     return "\n".join(rendered).strip()[:3900]
 
 
-def build_draft_buttons(genre: str = "") -> dict:
+def _copy_signature(row_number: int, expires_at: int) -> str:
+    payload = f"{int(row_number)}:{int(expires_at)}".encode("utf-8")
+    return hmac.new(BOT_TOKEN.encode("utf-8"), payload, hashlib.sha256).hexdigest()[:32]
+
+
+def _build_copy_url(row_number) -> str:
+    if not EDITORIAL_COPY_BASE_URL or not row_number:
+        return ""
+    try:
+        row_number = int(row_number)
+    except Exception:
+        return ""
+    expires_at = int(time.time()) + EDITORIAL_COPY_LINK_TTL_SEC
+    signature = _copy_signature(row_number, expires_at)
+    return f"{EDITORIAL_COPY_BASE_URL}/editorial-copy/{row_number}?exp={expires_at}&sig={signature}"
+
+
+def _plain_publish_text(html_text: str) -> str:
+    return _strip_html_for_length(html_text).strip()
+
+
+def build_draft_buttons(genre: str = "", html_text: str = "", row_number=None) -> dict:
     pending_data = f"pending:{genre}" if genre else "pending:all"
+    plain_text = _plain_publish_text(html_text) if html_text else ""
+
+    # Telegram's native clipboard button supports only 1-256 characters.
+    # For full reviews we link to a signed two-tap copy page on Render.
+    if plain_text and len(plain_text) <= 256:
+        copy_button = {"text": "📋 Копировать текст", "copy_text": {"text": plain_text}}
+    else:
+        copy_url = _build_copy_url(row_number)
+        if copy_url:
+            copy_button = {"text": "📋 Копировать текст", "url": copy_url}
+        else:
+            copy_button = {"text": "📋 Текст для копирования", "callback_data": "draft_copy"}
+
     return {
         "inline_keyboard": [
             [
-                {"text": "📋 Копировать текст", "callback_data": "draft_copy"},
+                copy_button,
                 {"text": "⬇️ Скачать обложку", "callback_data": "draft_cover"},
             ],
             [
@@ -1724,8 +1783,6 @@ def build_draft_buttons(genre: str = "") -> dict:
             ],
         ]
     }
-
-
 
 def _draft_parts_key(post: dict) -> str:
     return f"{get_chat_id(post)}:{get_thread_id(post)}"
@@ -1869,7 +1926,7 @@ def _recover_draft_parts_from_sheet(row_number, current_post: dict):
 
 
 def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
-    """Join review text + cover, with Google Sheets as a persistent fallback."""
+    """Pair only the text and cover that belong to the same review."""
     if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
         return post
 
@@ -1877,65 +1934,95 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
     if genre == "underground" or genre not in TARGET_CHANNELS:
         return post
 
-    # #сверхновые are handled only by the digest engine.
     if infer_post_type(get_post_text(post)) == "digest":
         return post
 
     key = _draft_parts_key(post)
     now_value = now_ts()
     row_number = post.get("_editorial_sheet_row")
+    incoming_text = _is_trusted_editorial_sender(post) and _has_meaningful_publish_text(post)
+    incoming_cover = bool(_post_has_cover_source(post) or post.get("_editorial_cover_url"))
 
+    # Best case: the review and cover arrived together. Never mix it with topic cache.
+    if incoming_text and incoming_cover:
+        direct = dict(post)
+        direct["_editorial_source_message_id"] = post.get("message_id")
+        direct["_editorial_draft_key"] = f"{key}:direct:{post.get('message_id')}:{row_number or ''}"
+        with editorial_draft_parts_lock:
+            editorial_draft_parts[key] = {
+                "updated_at": now_value,
+                "text_post": post,
+                "cover_post": post,
+                "sheet_row": row_number,
+            }
+        print("EDITORIAL DRAFT EXACT MESSAGE:", {"key": key, "row": row_number, "message_id": post.get("message_id")}, flush=True)
+        return direct
+
+    # Every new meaningful review text starts a fresh pairing slot for this topic.
+    # This is the key V11 fix: an old review can never remain as text for a new cover.
     with editorial_draft_parts_lock:
         _prune_editorial_draft_parts(now_value)
-        entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
+        if incoming_text:
+            entry = {
+                "updated_at": now_value,
+                "text_post": post,
+                "sheet_row": row_number,
+            }
+            editorial_draft_parts[key] = entry
+        else:
+            entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
 
         replied = post.get("reply_to_message") or {}
         if replied and _is_trusted_editorial_sender(replied) and _has_meaningful_publish_text(replied):
             entry["text_post"] = replied
 
-        if _is_trusted_editorial_sender(post) and _has_meaningful_publish_text(post):
-            entry["text_post"] = post
-
-        if _post_has_cover_source(post) or post.get("_editorial_cover_url"):
+        if incoming_cover:
             entry["cover_post"] = post
-
         if row_number:
             entry["sheet_row"] = row_number
-
         entry["updated_at"] = now_value
+
         text_post = entry.get("text_post")
         cover_post = entry.get("cover_post")
-        row_number = entry.get("sheet_row") or row_number
+        cached_row = entry.get("sheet_row")
 
-        print(
-            "EDITORIAL DRAFT PARTS:",
-            {
-                "key": key,
-                "genre": genre,
-                "incoming_message_id": post.get("message_id"),
-                "sheet_row": row_number,
-                "has_text": bool(text_post),
-                "has_cover": bool(cover_post),
-                "incoming_has_text": _has_meaningful_publish_text(post),
-                "incoming_has_cover": bool(_post_has_cover_source(post) or post.get("_editorial_cover_url")),
-                "sender_id": (post.get("from") or {}).get("id"),
-            },
-            flush=True,
-        )
+    row_number = row_number or cached_row
 
-    # Do the network fallback outside the lock.
-    if row_number and (not text_post or not cover_post):
+    # If Sheets told us the exact row, that row is authoritative. Always recover
+    # its text, even if topic memory currently contains something else.
+    if row_number:
         recovered_text, recovered_cover = _recover_draft_parts_from_sheet(row_number, post)
+        if recovered_text:
+            text_post = recovered_text
+        # Keep the incoming cover itself when present; otherwise use Sheets copy.
+        if not incoming_cover and recovered_cover:
+            cover_post = recovered_cover
+        elif incoming_cover:
+            cover_post = post
+
         with editorial_draft_parts_lock:
-            entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
-            if not entry.get("text_post") and recovered_text:
-                entry["text_post"] = recovered_text
-            if not entry.get("cover_post") and recovered_cover:
-                entry["cover_post"] = recovered_cover
+            entry = editorial_draft_parts.setdefault(key, {"updated_at": now_ts()})
+            if text_post:
+                entry["text_post"] = text_post
+            if cover_post:
+                entry["cover_post"] = cover_post
             entry["sheet_row"] = row_number
             entry["updated_at"] = now_ts()
-            text_post = entry.get("text_post")
-            cover_post = entry.get("cover_post")
+
+    print(
+        "EDITORIAL DRAFT PAIR:",
+        {
+            "key": key,
+            "genre": genre,
+            "incoming_message_id": post.get("message_id"),
+            "sheet_row": row_number,
+            "incoming_text": incoming_text,
+            "incoming_cover": incoming_cover,
+            "text_message_id": (text_post or {}).get("message_id"),
+            "cover_message_id": (cover_post or {}).get("message_id"),
+        },
+        flush=True,
+    )
 
     if not text_post or not cover_post:
         print(
@@ -1988,13 +2075,22 @@ def _is_cover_service_only_message(post: dict) -> bool:
 
 
 def attach_cover_to_recent_sheet_row(post: dict) -> bool:
-    """Attach a standalone cover message to the latest Predlozhka row in the same topic."""
+    """Attach a standalone cover to the exact current review whenever possible."""
     if not _is_cover_service_only_message(post):
         return False
     cover_file_id = extract_image_file_id(post) or ""
     cover_url = extract_cover_download_url(post) or ""
     if not cover_file_id and not cover_url:
         return False
+
+    key = _draft_parts_key(post)
+    preferred_row = None
+    with editorial_draft_parts_lock:
+        entry = editorial_draft_parts.get(key) or {}
+        preferred_row = entry.get("sheet_row")
+
+    reply_to_message_id = (post.get("reply_to_message") or {}).get("message_id") or ""
+
     try:
         resp = requests.post(
             WEBHOOK_URL,
@@ -2006,6 +2102,8 @@ def attach_cover_to_recent_sheet_row(post: dict) -> bool:
                 "cover_file_id": cover_file_id,
                 "cover_url": cover_url,
                 "cover_message_id": str(post.get("message_id") or ""),
+                "preferred_row": str(preferred_row or ""),
+                "reply_to_message_id": str(reply_to_message_id or ""),
             },
             timeout=60,
         )
@@ -2016,20 +2114,21 @@ def attach_cover_to_recent_sheet_row(post: dict) -> bool:
                 post["_editorial_sheet_row"] = int(data.get("row"))
                 print(
                     "EDITORIAL COVER ROW LINKED:",
-                    {"row": data.get("row"), "message_id": post.get("message_id")},
+                    {
+                        "row": data.get("row"),
+                        "message_id": post.get("message_id"),
+                        "match": data.get("match"),
+                    },
                     flush=True,
                 )
             else:
                 print("PREDLOZHKA COVER ATTACH NOT FOUND:", data, flush=True)
         except Exception as parse_error:
             print("PREDLOZHKA COVER ATTACH PARSE ERROR:", str(parse_error), flush=True)
-        # This is a service-only cover message; never append it as a separate review row.
         return True
     except Exception as e:
         print("PREDLOZHKA COVER ATTACH ERROR:", str(e), flush=True)
-        # Still consume the service-only message so it cannot create a junk row.
         return True
-
 
 def should_build_publish_preview(post: dict) -> bool:
     if not AUTOPUBLISH_PREVIEW_ENABLED:
@@ -2074,14 +2173,15 @@ def _schedule_result_cleanup(result: Optional[dict]):
         schedule_bot_message_cleanup(chat_id, message_id)
 
 
-def _send_draft_photo(chat_id, thread_id, prepared_path: str, html_text: str, genre: str):
+def _send_draft_photo(chat_id, thread_id, prepared_path: str, html_text: str, genre: str, row_number=None):
     plain_length = len(_strip_html_for_length(html_text))
+    buttons = build_draft_buttons(genre, html_text, row_number)
     if plain_length <= 950:
         data = {
             "chat_id": str(chat_id),
             "caption": html_text,
             "parse_mode": "HTML",
-            "reply_markup": json.dumps(build_draft_buttons(genre), ensure_ascii=False),
+            "reply_markup": json.dumps(buttons, ensure_ascii=False),
         }
         if thread_id:
             data["message_thread_id"] = str(thread_id)
@@ -2104,14 +2204,13 @@ def _send_draft_photo(chat_id, thread_id, prepared_path: str, html_text: str, ge
         "reply_to_message_id": photo_result.get("message_id"),
         "allow_sending_without_reply": True,
         "disable_web_page_preview": True,
-        "reply_markup": build_draft_buttons(genre),
+        "reply_markup": buttons,
     }
     if thread_id:
         text_payload["message_thread_id"] = thread_id
     text_result = telegram_api_json("sendMessage", text_payload)
     _schedule_result_cleanup(text_result)
     return text_result
-
 
 def send_publish_preview(post: dict):
     genre = get_genre_from_thread(get_thread_id(post))
@@ -2151,7 +2250,7 @@ def send_publish_preview(post: dict):
                 flush=True,
             )
             return
-        result = _send_draft_photo(get_chat_id(post), get_thread_id(post), prepared_path, caption, genre)
+        result = _send_draft_photo(get_chat_id(post), get_thread_id(post), prepared_path, caption, genre, post.get("_editorial_sheet_row"))
         print(
             "EDITORIAL DRAFT SENT:",
             {"genre": genre, "draft_message_id": result.get("message_id"), "source_message_id": post.get("message_id")},
@@ -3259,6 +3358,77 @@ def handle_review_callback(callback: dict):
         return True
 
     return False
+
+
+@app.get("/editorial-copy/<int:row_number>")
+def editorial_copy_page(row_number: int):
+    try:
+        expires_at = int(request.args.get("exp") or "0")
+    except Exception:
+        expires_at = 0
+    signature = str(request.args.get("sig") or "")
+    expected = _copy_signature(row_number, expires_at) if expires_at else ""
+    if not expires_at or int(time.time()) > expires_at or not hmac.compare_digest(signature, expected):
+        return Response("Ссылка для копирования недействительна или устарела.", status=403, content_type="text/plain; charset=utf-8")
+
+    try:
+        item = sheets_get("get_review", {"row": str(row_number)})
+    except Exception as e:
+        return Response(f"Не удалось получить текст: {e}", status=502, content_type="text/plain; charset=utf-8")
+
+    if item.get("status") != "ok":
+        return Response("Обзор не найден.", status=404, content_type="text/plain; charset=utf-8")
+
+    raw_text = str(item.get("title") or "")
+    genre = str(item.get("genre") or item.get("channel") or "")
+    synthetic = {
+        "text": raw_text,
+        "entities": _synthetic_text_link_entities(
+            raw_text,
+            str(item.get("yandex_link") or ""),
+            str(item.get("common_link") or ""),
+        ),
+    }
+    rich_html = build_publish_caption(synthetic, genre)
+    plain_text = _plain_publish_text(rich_html)
+
+    # JSON escaping is the safest way to embed arbitrary editorial text in JS.
+    rich_json = json.dumps(rich_html, ensure_ascii=False).replace("</", "<\\/")
+    plain_json = json.dumps(plain_text, ensure_ascii=False).replace("</", "<\\/")
+    page = f'''<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Копировать текст</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f5f7;margin:0;padding:20px;color:#111}}
+.card{{max-width:720px;margin:0 auto;background:#fff;border-radius:18px;padding:18px;box-shadow:0 6px 30px rgba(0,0,0,.08)}}
+button{{width:100%;border:0;border-radius:14px;padding:16px;font-size:17px;font-weight:700;background:#2481cc;color:#fff;cursor:pointer}}
+#status{{text-align:center;min-height:26px;margin:10px 0;color:#2481cc;font-weight:600}}
+.preview{{white-space:pre-wrap;line-height:1.45;border-top:1px solid #eee;padding-top:14px;word-break:break-word}}
+.preview blockquote{{border-left:3px solid #8b5cf6;margin:8px 0;padding-left:10px}}
+</style></head><body><div class="card">
+<button id="copy">📋 Скопировать весь текст</button><div id="status"></div><div class="preview">{rich_html}</div>
+</div><script>
+const rich={rich_json}; const plain={plain_json};
+async function copyAll(){{
+  const status=document.getElementById('status');
+  try{{
+    if(window.ClipboardItem && navigator.clipboard && navigator.clipboard.write){{
+      const item=new ClipboardItem({{'text/plain':new Blob([plain],{{type:'text/plain'}}),'text/html':new Blob([rich],{{type:'text/html'}})}});
+      await navigator.clipboard.write([item]);
+    }} else if(navigator.clipboard && navigator.clipboard.writeText){{
+      await navigator.clipboard.writeText(plain);
+    }} else {{ throw new Error('clipboard unavailable'); }}
+    status.textContent='✅ Текст скопирован в буфер';
+  }}catch(e){{
+    const ta=document.createElement('textarea'); ta.value=plain; document.body.appendChild(ta); ta.select();
+    try{{document.execCommand('copy'); status.textContent='✅ Текст скопирован в буфер';}}
+    catch(_){{status.textContent='Выдели текст ниже и скопируй вручную';}}
+    ta.remove();
+  }}
+}}
+document.getElementById('copy').addEventListener('click',copyAll);
+</script></body></html>'''
+    return Response(page, content_type="text/html; charset=utf-8")
 
 
 @app.get("/vk_auth")
