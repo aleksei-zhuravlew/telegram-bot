@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V22: V21 + strict trusted-bot-only Predlozhka capture and draft pairing.
+# V23: V22 + pending list sourced strictly from Predlozhka Title/Type/Status columns.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -2969,7 +2969,7 @@ def send_pending_reviews(chat_id, thread_id=None, genre: str = "all"):
             "script_version": result.get("script_version"),
             "count": result.get("count"),
             "skipped_terminal": result.get("skipped_terminal"),
-            "status_columns": result.get("status_columns"),
+            "source_of_truth": result.get("source_of_truth"),
             "requested_genre": genre,
         },
         flush=True,
