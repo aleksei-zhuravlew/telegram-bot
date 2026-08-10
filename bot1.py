@@ -1775,6 +1775,31 @@ def _looks_like_release_title(value: str) -> bool:
     return bool(re.search(r"\S\s+[—–-]\s+\S", clean))
 
 
+def _render_liked_heading_html(value: str) -> str:
+    """
+    Editorial rule:
+    only the words "Что понравилось" are bold.
+    The colon/question mark and the actual answer remain normal.
+    """
+    raw = value or ""
+    match = re.match(
+        r"^(\s*)(что понравилось)(\s*)([?:]?)(.*)$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return html_escape(raw)
+
+    leading, label, spacing, punctuation, rest = match.groups()
+    return (
+        f"{html_escape(leading)}"
+        f"<b>{html_escape(label)}</b>"
+        f"{html_escape(spacing)}"
+        f"{html_escape(punctuation)}"
+        f"{html_escape(rest)}"
+    )
+
+
 def build_publish_caption(post: dict, genre: str = "") -> str:
     """Build a ready editorial draft while preserving source formatting and links."""
     text = get_post_text(post)
@@ -1847,11 +1872,19 @@ def build_publish_caption(post: dict, genre: str = "") -> str:
             ensure_blank_line()
 
         if is_title:
+            # Editorial rule: the full Artist — Track title is always bold,
+            # regardless of whether the source bot supplied a bold entity.
+            line_html = f"<b>{line_html}</b>"
+
             disc = genre_emoji_html(genre)
             if disc and not raw_line.lstrip().startswith("💿"):
                 line_html = f"{disc} {line_html}"
 
         if is_liked:
+            # Do not inherit accidental bold from the source for the whole line.
+            # Only the words "Что понравилось" are bold; the answer is normal.
+            line_html = _render_liked_heading_html(raw_line)
+
             marker = liked_section_emoji_html()
             if marker:
                 line_html = f"{marker} {line_html}"
@@ -2166,12 +2199,32 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
 
     row_number = row_number or cached_row
 
-    # If Sheets told us the exact row, that row is authoritative. Always recover
-    # its text, even if topic memory currently contains something else.
+    # Sheets remains authoritative for WHICH row/cover belongs to the review,
+    # but it must not overwrite a live Telegram text message that already has
+    # the original entities. Hidden text_link entities are where VK/Telegram
+    # hyperlinks and source formatting live; Sheets stores only plain text.
     if row_number:
         recovered_text, recovered_cover = _recover_draft_parts_from_sheet(row_number, post)
+
         if recovered_text:
-            text_post = recovered_text
+            if not text_post:
+                text_post = recovered_text
+            else:
+                live_text = get_post_text(text_post).strip()
+                sheet_text = get_post_text(recovered_text).strip()
+                live_entities = (
+                    text_post.get("entities")
+                    or text_post.get("caption_entities")
+                    or []
+                )
+
+                # Same review text + live Telegram entities -> keep live object.
+                # If text differs, prefer the authoritative sheet row.
+                # If there are no live entities, recovery is still useful because
+                # it rebuilds the Yandex/Common text links synthetically.
+                if live_text != sheet_text or not live_entities:
+                    text_post = recovered_text
+
         # Keep the incoming cover itself when present; otherwise use Sheets copy.
         if not incoming_cover and recovered_cover:
             cover_post = recovered_cover
