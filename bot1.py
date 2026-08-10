@@ -109,7 +109,7 @@ print(
     flush=True,
 )
 
-# V19: V18 + robust pending title extraction.
+# V22: V21 + strict trusted-bot-only Predlozhka capture and draft pairing.
 # Keep the latest parts briefly so the editorial draft is assembled from both.
 EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
 
@@ -939,6 +939,18 @@ def is_allowed_predlozhka_thread(post: dict) -> bool:
         return False
 
 
+def is_trusted_predlozhka_sender(post: dict) -> bool:
+    """
+    Predlozhka automation must react only to the configured external review bot(s).
+    Human/editor chatter in the forum topics must never be written to Sheets,
+    attached as a cover, or treated as review text.
+    """
+    sender = post.get("from") or {}
+    if not sender.get("is_bot"):
+        return False
+    return str(sender.get("id") or "") in AUTOPUBLISH_TRUSTED_BOT_IDS
+
+
 def send_predlozhka_to_sheets(post: dict):
     """
     Writes supergroup/topic messages to the Predlozhka sheet.
@@ -973,6 +985,21 @@ def send_predlozhka_to_sheets(post: dict):
 
     if not PREDLOZHKA_CAPTURE_ENABLED:
         print("PREDLOZHKA CAPTURE DISABLED: set PREDLOZHKA_CAPTURE_ENABLED=1 after Apps Script update", flush=True)
+        return
+
+    if not is_trusted_predlozhka_sender(post):
+        sender = post.get("from") or {}
+        print(
+            "PREDLOZHKA CAPTURE SKIPPED: sender is not trusted review bot",
+            {
+                "from_id": sender.get("id"),
+                "from_username": sender.get("username"),
+                "from_is_bot": sender.get("is_bot"),
+                "thread_id": get_thread_id(post),
+                "text": get_post_text(post)[:120],
+            },
+            flush=True,
+        )
         return
 
     text = get_post_text(post)
@@ -1903,10 +1930,7 @@ def _draft_parts_key(post: dict) -> str:
 
 
 def _is_trusted_editorial_sender(post: dict) -> bool:
-    sender = post.get("from") or {}
-    if not sender.get("is_bot"):
-        return True
-    return str(sender.get("id") or "") in AUTOPUBLISH_TRUSTED_BOT_IDS
+    return is_trusted_predlozhka_sender(post)
 
 
 def _has_meaningful_publish_text(post: dict) -> bool:
@@ -2290,8 +2314,7 @@ def should_build_publish_preview(post: dict) -> bool:
     if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
         return False
 
-    sender = post.get("from") or {}
-    if sender.get("is_bot") and str(sender.get("id") or "") not in AUTOPUBLISH_TRUSTED_BOT_IDS:
+    if not is_trusted_predlozhka_sender(post):
         return False
 
     genre = get_genre_from_thread(get_thread_id(post))
@@ -2940,6 +2963,17 @@ def send_pending_reviews(chat_id, thread_id=None, genre: str = "all"):
     if genre and genre != "all":
         params["genre"] = genre
     result = sheets_get("get_pending_reviews", params)
+    print(
+        "PENDING REVIEWS RESULT:",
+        {
+            "script_version": result.get("script_version"),
+            "count": result.get("count"),
+            "skipped_terminal": result.get("skipped_terminal"),
+            "status_columns": result.get("status_columns"),
+            "requested_genre": genre,
+        },
+        flush=True,
+    )
     payload = {"chat_id": chat_id, "text": build_pending_reviews_text(result.get("items") or [], genre), "parse_mode": "HTML", "disable_web_page_preview": True}
     if thread_id:
         payload["message_thread_id"] = thread_id
@@ -3697,7 +3731,11 @@ def telegram_webhook():
 
         try:
             cover_attached = False
-            if is_allowed_predlozhka_chat(incoming_message) and is_allowed_predlozhka_thread(incoming_message):
+            if (
+                is_allowed_predlozhka_chat(incoming_message)
+                and is_allowed_predlozhka_thread(incoming_message)
+                and is_trusted_predlozhka_sender(incoming_message)
+            ):
                 cover_attached = attach_cover_to_recent_sheet_row(incoming_message)
             if not cover_attached:
                 send_predlozhka_to_sheets(incoming_message)
