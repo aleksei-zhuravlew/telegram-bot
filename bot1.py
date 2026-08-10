@@ -12,6 +12,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 import requests
 from PIL import Image, ImageOps
+from html import unescape
 from flask import Flask, request
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -73,6 +74,25 @@ AUTOPUBLISH_CHECK_INTERVAL_SEC = int(os.environ.get("AUTOPUBLISH_CHECK_INTERVAL_
 AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")  # legacy fallback; Sheets is used for new schedules
 GENRE_FRAME_DIR = os.environ.get("GENRE_FRAME_DIR", "genre_frames")
 
+# Channel publishing is intentionally paused. The bot only prepares editorial drafts.
+AUTOPUBLISH_CHANNEL_ENABLED = os.environ.get("AUTOPUBLISH_CHANNEL_ENABLED", "0") == "1"
+
+# Trusted external bot that sends reviews into Predlozhka topics.
+AUTOPUBLISH_TRUSTED_BOT_IDS_RAW = os.environ.get(
+    "AUTOPUBLISH_TRUSTED_BOT_IDS",
+    "7287549819",
+)
+AUTOPUBLISH_TRUSTED_BOT_IDS = set()
+for _bot_id in AUTOPUBLISH_TRUSTED_BOT_IDS_RAW.split(","):
+    _bot_id = _bot_id.strip()
+    if _bot_id:
+        AUTOPUBLISH_TRUSTED_BOT_IDS.add(_bot_id)
+
+# Bot service messages are removed shortly before Telegram's 48-hour deletion limit.
+BOT_MESSAGE_CLEANUP_ENABLED = os.environ.get("BOT_MESSAGE_CLEANUP_ENABLED", "1") == "1"
+BOT_MESSAGE_CLEANUP_AFTER_MINUTES = int(os.environ.get("BOT_MESSAGE_CLEANUP_AFTER_MINUTES", str(47 * 60 + 40)))
+BOT_MESSAGE_CLEANUP_CHECK_SEC = int(os.environ.get("BOT_MESSAGE_CLEANUP_CHECK_SEC", "300"))
+
 TARGET_CHANNELS = {
     "rock": "@chto_music_rock",
     "indie": "@chto_music_indie",
@@ -93,8 +113,30 @@ GENRE_FRAME_FILES = {
     # electronica intentionally has no frame
 }
 
+# Unique channel-disc custom emoji. They are used in editorial drafts before
+# “Artist — Track”. All have 💿 as a safe fallback glyph.
+GENRE_EMOJI_MAP = {
+    "glavred": {"emoji_id": "5332472742916678524", "visible": "💿"},
+    "rock": {"emoji_id": "5330416810791559528", "visible": "💿"},
+    "pop": {"emoji_id": "5332614176189732263", "visible": "💿"},
+    "folk": {"emoji_id": "5330462307380126280", "visible": "💿"},
+    "indie": {"emoji_id": "5330524983837875288", "visible": "💿"},
+    "hiphop": {"emoji_id": "5330100967486546882", "visible": "💿"},
+    "electronica": {"emoji_id": "5332493801141328118", "visible": "💿"},
+}
+
+# Editorial section marker before the literal line “Что понравилось?”.
+LIKED_SECTION_EMOJI = {
+    "emoji_id": "5379970773358227593",
+    "visible": "✨",
+}
+
 AUTHOR_EMOJI_MAP = {
     "Алексей Журавлев": {
+        "emoji_id": "5429396071589642872",
+        "visible": "😎",
+    },
+    "Журавлев Алексей": {
         "emoji_id": "5429396071589642872",
         "visible": "😎",
     },
@@ -111,6 +153,8 @@ scheduled_posts_lock = threading.Lock()
 autopublish_scheduler_started = False
 autopublish_scheduler_lock = threading.Lock()
 preview_dedup = {}
+cleanup_scheduler_started = False
+cleanup_scheduler_lock = threading.Lock()
 
 # ======================
 # PREDLOZHKA THREAD MAP
@@ -687,7 +731,8 @@ def _send_emojipack_lines(chat_id, lines: List[str], thread_id=None):
                 payload["message_thread_id"] = int(thread_id)
             except Exception:
                 pass
-        telegram_api_json("sendMessage", payload)
+        result = telegram_api_json("sendMessage", payload)
+        _schedule_result_cleanup(result)
 
 
 def handle_emojipack_command(post: dict) -> bool:
@@ -775,7 +820,8 @@ def handle_emojipack_command(post: dict) -> bool:
                 payload["message_thread_id"] = int(thread_id)
             except Exception:
                 pass
-        telegram_api_json("sendMessage", payload)
+        result = telegram_api_json("sendMessage", payload)
+        _schedule_result_cleanup(result)
 
     return True
 
@@ -877,6 +923,8 @@ def send_predlozhka_to_sheets(post: dict):
     genre = get_genre_from_thread(thread_id)
 
     yandex_link, common_link = extract_music_links_from_post(post)
+    cover_file_id = extract_image_file_id(post) or ""
+    cover_url = extract_cover_download_url(post)
     post_type = infer_post_type(text)
     status = safe_status_for_predlozhka(post_type, yandex_link, common_link)
 
@@ -901,6 +949,8 @@ def send_predlozhka_to_sheets(post: dict):
         "status": status,
         "yandex_link": yandex_link,
         "common_link": common_link,
+        "cover_file_id": cover_file_id,
+        "cover_url": cover_url,
     }
 
     try:
@@ -1546,15 +1596,35 @@ def _clean_publish_lines(text: str):
     return compact
 
 
-def build_publish_caption(post: dict) -> str:
-    """
-    Build the ready-to-publish caption:
-    - preserve Telegram text hyperlinks and formatting;
-    - remove lines marked “удалить перед публикацией”;
-    - keep the public @channel mention and move it to the bottom;
-    - turn the first meaningful line after the title into a blockquote;
-    - append the mapped custom emoji to the author line.
-    """
+def custom_emoji_html(config: Optional[dict]) -> str:
+    config = config or {}
+    emoji_id = str(config.get("emoji_id") or "").strip()
+    visible = str(config.get("visible") or "✨")
+    if not emoji_id:
+        return html_escape(visible)
+    return f'<tg-emoji emoji-id="{html_escape(emoji_id)}">{html_escape(visible)}</tg-emoji>'
+
+
+def genre_emoji_html(genre: str) -> str:
+    return custom_emoji_html(GENRE_EMOJI_MAP.get((genre or "").strip()))
+
+
+def liked_section_emoji_html() -> str:
+    return custom_emoji_html(LIKED_SECTION_EMOJI)
+
+
+def _strip_html_for_length(value: str) -> str:
+    value = re.sub(r"<[^>]+>", "", value or "")
+    return unescape(value)
+
+
+def _line_is_liked_heading(value: str) -> bool:
+    clean = re.sub(r"\s+", " ", (value or "").strip()).casefold()
+    return clean in {"что понравилось?", "что понравилось"}
+
+
+def build_publish_caption(post: dict, genre: str = "") -> str:
+    """Build a ready editorial draft while preserving source formatting and links."""
     text = get_post_text(post)
     entities = post.get("entities") or post.get("caption_entities") or []
     author = extract_author(text)
@@ -1562,10 +1632,6 @@ def build_publish_caption(post: dict) -> str:
     lines = _clean_publish_lines(text)
 
     meaningful_indexes = [i for i, item in enumerate(lines) if item["text"].strip()]
-
-    # Editorial rule:
-    # - when the first line clearly looks like “Artist — Track”, quote the next meaningful line;
-    # - otherwise quote the very first meaningful line.
     quote_index = None
     if meaningful_indexes:
         first_index = meaningful_indexes[0]
@@ -1578,6 +1644,7 @@ def build_publish_caption(post: dict) -> str:
 
     rendered = []
     author_replaced = False
+    first_meaningful = meaningful_indexes[0] if meaningful_indexes else None
 
     for index, item in enumerate(lines):
         if not item["text"].strip():
@@ -1587,6 +1654,16 @@ def build_publish_caption(post: dict) -> str:
 
         raw_line = item["text"]
         line_html = _render_entity_line_html(text, entities, item["start"], item["end"])
+
+        if index == first_meaningful:
+            disc = genre_emoji_html(genre)
+            if disc and not raw_line.lstrip().startswith("💿"):
+                line_html = f"{disc} {line_html}"
+
+        if _line_is_liked_heading(raw_line):
+            marker = liked_section_emoji_html()
+            if marker:
+                line_html = f"{marker} {line_html}"
 
         if re.match(r"^\s*Автор\s*[:\-–—]", raw_line, flags=re.IGNORECASE):
             if emoji_html:
@@ -1603,22 +1680,23 @@ def build_publish_caption(post: dict) -> str:
             rendered.append("")
         rendered.append(f"{emoji_html} Автор: {html_escape(author)}")
 
-    caption = "\n".join(rendered).strip()
-    # Telegram photo captions are limited to 1024 characters after entity parsing.
-    return caption[:1000]
+    return "\n".join(rendered).strip()[:3900]
 
-def build_publish_buttons(genre: str) -> dict:
+
+def build_draft_buttons(genre: str = "") -> dict:
+    pending_data = f"pending:{genre}" if genre else "pending:all"
     return {
         "inline_keyboard": [
             [
-                {"text": "✅ Опубликовать сейчас", "callback_data": f"pub_now:{genre}"},
-                {"text": "🕒 Опубликовать позже", "callback_data": f"pub_later:{genre}"},
+                {"text": "📋 Копировать текст", "callback_data": "draft_copy"},
+                {"text": "⬇️ Скачать обложку", "callback_data": "draft_cover"},
             ],
             [
-                {"text": "❌ Отменить", "callback_data": f"pub_cancel:{genre}"},
+                {"text": "📚 Невышедшие посты", "callback_data": pending_data},
             ],
         ]
     }
+
 
 
 def should_build_publish_preview(post: dict) -> bool:
@@ -1626,16 +1704,25 @@ def should_build_publish_preview(post: dict) -> bool:
         return False
     if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
         return False
-    if (post.get("from") or {}).get("is_bot"):
+
+    sender = post.get("from") or {}
+    if sender.get("is_bot") and str(sender.get("id") or "") not in AUTOPUBLISH_TRUSTED_BOT_IDS:
         return False
+
     genre = get_genre_from_thread(get_thread_id(post))
     if genre == "underground" or genre not in TARGET_CHANNELS:
         return False
+
+    if infer_post_type(get_post_text(post)) == "digest":
+        return False
+
     if not extract_image_file_id(post) and not extract_cover_download_url(post):
         return False
+
     message_id = post.get("message_id")
     if not message_id:
         return False
+
     key = f"{get_chat_id(post)}:{message_id}"
     cutoff = now_ts() - PROCESSED_TTL_SEC
     for old_key in [k for k, ts in preview_dedup.items() if ts < cutoff]:
@@ -1644,6 +1731,54 @@ def should_build_publish_preview(post: dict) -> bool:
         return False
     preview_dedup[key] = now_ts()
     return True
+
+
+def _schedule_result_cleanup(result: Optional[dict]):
+    if not result:
+        return
+    chat_id = (result.get("chat") or {}).get("id")
+    message_id = result.get("message_id")
+    if chat_id and message_id:
+        schedule_bot_message_cleanup(chat_id, message_id)
+
+
+def _send_draft_photo(chat_id, thread_id, prepared_path: str, html_text: str, genre: str):
+    plain_length = len(_strip_html_for_length(html_text))
+    if plain_length <= 950:
+        data = {
+            "chat_id": str(chat_id),
+            "caption": html_text,
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(build_draft_buttons(genre), ensure_ascii=False),
+        }
+        if thread_id:
+            data["message_thread_id"] = str(thread_id)
+        with open(prepared_path, "rb") as photo:
+            result = telegram_api_multipart("sendPhoto", data, {"photo": ("ready_post.png", photo, "image/png")})
+        _schedule_result_cleanup(result)
+        return result
+
+    photo_data = {"chat_id": str(chat_id)}
+    if thread_id:
+        photo_data["message_thread_id"] = str(thread_id)
+    with open(prepared_path, "rb") as photo:
+        photo_result = telegram_api_multipart("sendPhoto", photo_data, {"photo": ("ready_post.png", photo, "image/png")})
+    _schedule_result_cleanup(photo_result)
+
+    text_payload = {
+        "chat_id": chat_id,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "reply_to_message_id": photo_result.get("message_id"),
+        "allow_sending_without_reply": True,
+        "disable_web_page_preview": True,
+        "reply_markup": build_draft_buttons(genre),
+    }
+    if thread_id:
+        text_payload["message_thread_id"] = thread_id
+    text_result = telegram_api_json("sendMessage", text_payload)
+    _schedule_result_cleanup(text_result)
+    return text_result
 
 
 def send_publish_preview(post: dict):
@@ -1659,26 +1794,14 @@ def send_publish_preview(post: dict):
         if image_file_id:
             source_path = tg_download_file(image_file_id)
         else:
-            print("AUTOPUBLISH COVER DOWNLOAD:", {"genre": genre, "url": cover_url}, flush=True)
+            print("DRAFT COVER DOWNLOAD:", {"genre": genre, "url": cover_url}, flush=True)
             source_path = download_cover_from_url(cover_url)
         prepared_path = prepare_framed_cover(source_path, genre)
-        caption = build_publish_caption(post)
-        data = {
-            "chat_id": str(get_chat_id(post)),
-            "caption": caption,
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps(build_publish_buttons(genre), ensure_ascii=False),
-        }
-        thread_id = get_thread_id(post)
-        if thread_id:
-            data["message_thread_id"] = str(thread_id)
-
-        with open(prepared_path, "rb") as photo:
-            result = telegram_api_multipart("sendPhoto", data, {"photo": ("ready_post.png", photo, "image/png")})
-
+        caption = build_publish_caption(post, genre)
+        result = _send_draft_photo(get_chat_id(post), get_thread_id(post), prepared_path, caption, genre)
         print(
-            "AUTOPUBLISH PREVIEW SENT:",
-            {"genre": genre, "preview_message_id": result.get("message_id"), "source_message_id": post.get("message_id")},
+            "EDITORIAL DRAFT SENT:",
+            {"genre": genre, "draft_message_id": result.get("message_id"), "source_message_id": post.get("message_id")},
             flush=True,
         )
     finally:
@@ -1688,6 +1811,7 @@ def send_publish_preview(post: dict):
                     os.remove(path)
                 except OSError:
                     pass
+
 
 
 def _utf16_length(value: str) -> int:
@@ -1762,7 +1886,9 @@ def extract_preview_payload(message: dict) -> dict:
 
 
 def publish_preview_payload(preview: dict, genre: str) -> dict:
-    """Send the prepared preview as a new channel post, preserving custom emoji entities."""
+    """Legacy publisher. Disabled while editorial auto-posting is paused."""
+    if not AUTOPUBLISH_CHANNEL_ENABLED:
+        raise RuntimeError("Автопубликация в каналы временно отключена")
     target = TARGET_CHANNELS.get(genre)
     if not target:
         raise RuntimeError(f"Target channel is not configured for genre={genre}")
@@ -1842,6 +1968,19 @@ def parse_schedule_time(value: str):
 
 
 def handle_publish_callback(callback: dict) -> bool:
+    data = callback.get("data") or ""
+    if not data.startswith(("pub_now:", "pub_later:", "pub_cancel:")):
+        return False
+    callback_id = callback.get("id")
+    telegram_api("answerCallbackQuery", {
+        "callback_query_id": callback_id,
+        "text": "Автопубликация временно отключена. Создай новый предпросмотр.",
+        "show_alert": True,
+    })
+    return True
+
+
+def _legacy_handle_publish_callback_disabled(callback: dict) -> bool:
     data = callback.get("data") or ""
     if not data.startswith(("pub_now:", "pub_later:", "pub_cancel:")):
         return False
@@ -2046,6 +2185,216 @@ def start_autopublish_scheduler():
 
 
 # ======================
+# EDITORIAL DRAFT BUTTONS / PENDING LIST / CLEANUP
+# ======================
+def _message_text_and_entities(message: dict):
+    if message.get("text") is not None:
+        return message.get("text") or "", message.get("entities") or []
+    return message.get("caption") or "", message.get("caption_entities") or []
+
+
+def _draft_photo_message(message: dict) -> dict:
+    if message.get("photo"):
+        return message
+    replied = message.get("reply_to_message") or {}
+    if replied.get("photo"):
+        return replied
+    return {}
+
+
+def handle_draft_callback(callback: dict) -> bool:
+    data = callback.get("data") or ""
+    if data not in ("draft_copy", "draft_cover"):
+        return False
+    callback_id = callback.get("id")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    thread_id = message.get("message_thread_id")
+
+    if data == "draft_copy":
+        text_value, entities = _message_text_and_entities(message)
+        if not text_value:
+            replied = message.get("reply_to_message") or {}
+            text_value, entities = _message_text_and_entities(replied)
+        if not text_value:
+            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Не нашёл текст в предпросмотре", "show_alert": True})
+            return True
+        payload = {"chat_id": chat_id, "text": text_value[:4096], "entities": entities, "disable_web_page_preview": True}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
+        result = telegram_api_json("sendMessage", payload)
+        _schedule_result_cleanup(result)
+        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Текст отправлен отдельным сообщением — можно копировать", "show_alert": False})
+        return True
+
+    photo_message = _draft_photo_message(message)
+    photos = photo_message.get("photo") or []
+    if not photos:
+        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Не нашёл готовую обложку", "show_alert": True})
+        return True
+
+    source_path = ""
+    png_path = ""
+    try:
+        source_path = tg_download_file(photos[-1].get("file_id"))
+        with Image.open(source_path) as image:
+            ready = image.convert("RGB")
+            if ready.size != (1280, 1280):
+                ready = ImageOps.fit(ready, (1280, 1280), method=Image.Resampling.LANCZOS)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            png_path = tmp.name
+            tmp.close()
+            ready.save(png_path, "PNG", optimize=True)
+        data_payload = {"chat_id": str(chat_id)}
+        if thread_id:
+            data_payload["message_thread_id"] = str(thread_id)
+        with open(png_path, "rb") as doc:
+            result = telegram_api_multipart("sendDocument", data_payload, {"document": ("cover_1280.png", doc, "image/png")})
+        _schedule_result_cleanup(result)
+        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Готовая обложка отправлена файлом", "show_alert": False})
+    finally:
+        for path in (source_path, png_path):
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    return True
+
+
+def _pending_title(raw_text: str) -> str:
+    title, _ = split_digest_post_text(raw_text or "")
+    return title or extract_digest_title(raw_text or "") or "Публикация"
+
+
+def build_pending_reviews_text(items: List[dict], requested_genre: str = "") -> str:
+    if not items:
+        suffix = f" жанра {genre_label(requested_genre)}" if requested_genre and requested_genre != "all" else ""
+        return f"✅ Невышедших постов{suffix} сейчас нет."
+    grouped = {}
+    for item in items:
+        genre = (item.get("genre") or item.get("channel") or "other").strip() or "other"
+        grouped.setdefault(genre, []).append(item)
+    parts = ["📚 <b>Невышедшие посты</b>", ""]
+    ordered = ["glavred", "rock", "indie", "folk", "pop", "hiphop", "electronica", "underground"]
+    keys = [g for g in ordered if g in grouped] + [g for g in grouped if g not in ordered]
+    for genre in keys:
+        parts.append(f"<b>{html_escape(genre_label(genre))} — {len(grouped[genre])}</b>")
+        for item in grouped[genre]:
+            title = html_escape(_pending_title(item.get("title") or ""))
+            link = item.get("link") or item.get("common_link") or item.get("yandex_link") or ""
+            parts.append(f'• <a href="{html_escape(first_link(link))}">{title}</a>' if link else f"• {title}")
+        parts.append("")
+    value = "\n".join(parts).strip()
+    if len(_strip_html_for_length(value)) <= 3900:
+        return value
+    compact = [parts[0], "", f"Всего: {len(items)}. Список сокращён из-за лимита Telegram.", ""]
+    for line in parts[2:]:
+        compact.append(line)
+        if len(_strip_html_for_length("\n".join(compact))) > 3700:
+            compact.pop()
+            break
+    return "\n".join(compact).strip()
+
+
+def send_pending_reviews(chat_id, thread_id=None, genre: str = "all"):
+    params = {"limit": "200"}
+    if genre and genre != "all":
+        params["genre"] = genre
+    result = sheets_get("get_pending_reviews", params)
+    payload = {"chat_id": chat_id, "text": build_pending_reviews_text(result.get("items") or [], genre), "parse_mode": "HTML", "disable_web_page_preview": True}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    sent = telegram_api_json("sendMessage", payload)
+    _schedule_result_cleanup(sent)
+    return sent
+
+
+def handle_pending_callback(callback: dict) -> bool:
+    data = callback.get("data") or ""
+    if not data.startswith("pending:"):
+        return False
+    genre = data.split(":", 1)[1] or "all"
+    callback_id = callback.get("id")
+    context = callback_message_context(callback)
+    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Собираю список невышедших постов", "show_alert": False})
+    send_pending_reviews(context.get("chat_id"), context.get("thread_id"), genre)
+    return True
+
+
+def handle_editorial_menu_command(post: dict) -> bool:
+    text = get_post_text(post).strip()
+    command = text.split()[0].split("@")[0].lower() if text else ""
+    if command not in ("/menu", "/pending"):
+        return False
+    chat_id = get_chat_id(post)
+    thread_id = get_thread_id(post)
+    if command == "/pending":
+        send_pending_reviews(chat_id, thread_id, get_genre_from_thread(thread_id) or "all")
+        return True
+    payload = {"chat_id": chat_id, "text": "Редакционное меню", "reply_markup": {"inline_keyboard": [[{"text": "📚 Невышедшие посты", "callback_data": "pending:all"}]]}}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    result = telegram_api_json("sendMessage", payload)
+    _schedule_result_cleanup(result)
+    return True
+
+
+def schedule_bot_message_cleanup(chat_id, message_id):
+    if not BOT_MESSAGE_CLEANUP_ENABLED or not chat_id or not message_id:
+        return
+    try:
+        delete_at = datetime.now(get_autopublish_tz()) + timedelta(minutes=BOT_MESSAGE_CLEANUP_AFTER_MINUTES)
+        result = sheets_post_action("add_cleanup_task", {"task": {"id": f"{chat_id}:{message_id}", "chat_id": str(chat_id), "message_id": str(message_id), "delete_at": delete_at.isoformat(), "status": "scheduled"}})
+        if result.get("error"):
+            print("CLEANUP QUEUE ERROR:", result, flush=True)
+    except Exception as e:
+        print("CLEANUP QUEUE ERROR:", str(e), flush=True)
+
+
+def run_cleanup_once():
+    if not BOT_MESSAGE_CLEANUP_ENABLED:
+        return
+    try:
+        result = sheets_get("get_due_cleanup_tasks", {"limit": "50"})
+    except Exception as e:
+        print("CLEANUP GET ERROR:", str(e), flush=True)
+        return
+    for task in result.get("tasks") or []:
+        task_id = str(task.get("id") or "")
+        error_text = ""
+        try:
+            telegram_api_json("deleteMessage", {"chat_id": task.get("chat_id"), "message_id": int(task.get("message_id"))})
+        except Exception as e:
+            error_text = str(e)
+            print("CLEANUP DELETE ERROR:", {"task": task, "error": error_text}, flush=True)
+        try:
+            sheets_post_action("mark_cleanup_done", {"id": task_id, "error": error_text})
+        except Exception as e:
+            print("CLEANUP MARK ERROR:", str(e), flush=True)
+
+
+def cleanup_scheduler_loop():
+    print("CLEANUP SCHEDULER STARTED", {"interval_sec": BOT_MESSAGE_CLEANUP_CHECK_SEC}, flush=True)
+    time.sleep(30)
+    while True:
+        run_cleanup_once()
+        time.sleep(BOT_MESSAGE_CLEANUP_CHECK_SEC)
+
+
+def start_cleanup_scheduler():
+    global cleanup_scheduler_started
+    if not BOT_MESSAGE_CLEANUP_ENABLED:
+        return
+    with cleanup_scheduler_lock:
+        if cleanup_scheduler_started:
+            return
+        thread = threading.Thread(target=cleanup_scheduler_loop, daemon=True)
+        thread.start()
+        cleanup_scheduler_started = True
+
+
+# ======================
 # REVIEW ENGINE — SAFE ADDITION
 # ======================
 review_scheduler_started = False
@@ -2148,7 +2497,8 @@ def send_review_reminder(reminder: dict):
         except Exception:
             pass
 
-    telegram_api_json("sendMessage", payload)
+    result = telegram_api_json("sendMessage", payload)
+    _schedule_result_cleanup(result)
     print("REVIEW REMINDER SENT:", {"row": row_number, "chat_id": chat_id, "thread_id": thread_id}, flush=True)
 
 
@@ -2267,53 +2617,95 @@ def first_link(value: str) -> str:
 def build_digest_text(digest: dict) -> str:
     genre = digest.get("genre") or digest.get("Genre") or ""
     items = digest.get("items") or []
-
-    header = f"Дайджест сверхновых жанра {html_escape(genre_label(genre))}"
-    text_parts = [header, ""]
-
+    disc = genre_emoji_html(genre)
+    header_text = f"Дайджест сверхновых жанра {html_escape(genre_label(genre))}"
+    header = f"{disc} {header_text}" if disc else header_text
+    text_parts = [f"<b>{header}</b>", ""]
     for item in items:
         raw_text = item.get("title") or item.get("Title") or ""
         item_title, review_text = split_digest_post_text(raw_text)
-
         yandex = first_link(item.get("yandex_link") or item.get("Yandex Link") or "")
         common = first_link(item.get("common_link") or item.get("Common Link") or "")
-        # Главред просит вшитую гиперссылку именно на мультиссылку.
-        # Если Common Link нет, используем Яндекс как fallback.
         link_for_title = common or yandex
-
         safe_title = html_escape(item_title)
-
-        if link_for_title:
-            # Bold clickable artist/title.
-            text_parts.append(f'<b><a href="{html_escape(link_for_title)}">{safe_title}</a></b>')
-        else:
-            text_parts.append(f"<b>{safe_title}</b>")
-
+        text_parts.append(f'<b><a href="{html_escape(link_for_title)}">{safe_title}</a></b>' if link_for_title else f"<b>{safe_title}</b>")
         if review_text:
             text_parts.append("")
-
             review_lines = [line.strip() for line in review_text.splitlines() if line.strip()]
-
             if review_lines:
-                # First semantic line after artist/title becomes a Telegram quote.
-                # Example:
-                # Artist - Song
-                # Что-то на западном      ← quote
-                # Main review text        ← normal text
-                quote_line = review_lines[0]
-                rest_text = "\n".join(review_lines[1:]).strip()
-
-                text_parts.append(f"<blockquote>{html_escape(quote_line)}</blockquote>")
-
-                if rest_text:
+                text_parts.append(f"<blockquote>{html_escape(review_lines[0])}</blockquote>")
+                if len(review_lines) > 1:
                     text_parts.append("")
-                    text_parts.append(html_escape(rest_text))
-
+                    for line in review_lines[1:]:
+                        text_parts.append(f"{liked_section_emoji_html()} {html_escape(line)}" if _line_is_liked_heading(line) else html_escape(line))
         text_parts.append("")
-
     text_parts.append("#сверхновые")
-
     return "\n".join(text_parts).strip()[:3900]
+
+
+def _digest_cover_source(item: dict) -> str:
+    file_id = str(item.get("cover_file_id") or item.get("Cover File ID") or "").strip()
+    cover_url = str(item.get("cover_url") or item.get("Cover URL") or "").strip()
+    if file_id:
+        return tg_download_file(file_id)
+    if cover_url:
+        return download_cover_from_url(cover_url)
+    return ""
+
+
+def _digest_placeholder_image() -> Image.Image:
+    return Image.new("RGB", (720, 720), (28, 28, 28))
+
+
+def _apply_frame_to_image(base: Image.Image, genre: str) -> Image.Image:
+    result = base.convert("RGBA")
+    frame_path = resolve_frame_path(genre)
+    if frame_path:
+        with Image.open(frame_path) as frame_source:
+            frame = frame_source.convert("RGBA")
+            if frame.size != result.size:
+                frame = frame.resize(result.size, Image.Resampling.LANCZOS)
+            result = Image.alpha_composite(result, frame)
+    elif genre in GENRE_FRAME_FILES:
+        raise RuntimeError(f"Не найдена рамка для жанра {genre}: {GENRE_FRAME_FILES.get(genre)}")
+    return result
+
+
+def prepare_digest_collage(items: List[dict], genre: str) -> str:
+    paths = []
+    covers = []
+    try:
+        for item in (items or [])[:5]:
+            try:
+                path = _digest_cover_source(item)
+                if path:
+                    paths.append(path)
+                    with Image.open(path) as source:
+                        covers.append(source.convert("RGB").copy())
+                else:
+                    covers.append(_digest_placeholder_image())
+            except Exception as e:
+                print("DIGEST COVER ERROR:", {"item": item.get("row"), "error": str(e)}, flush=True)
+                covers.append(_digest_placeholder_image())
+        while len(covers) < 5:
+            covers.append(_digest_placeholder_image())
+        canvas = Image.new("RGB", (1280, 1280), (20, 20, 20))
+        for image, pos in zip(covers[:4], [(0, 0), (580, 0), (0, 580), (580, 580)]):
+            canvas.paste(ImageOps.fit(image, (700, 700), method=Image.Resampling.LANCZOS), pos)
+        center = ImageOps.fit(covers[4], (650, 650), method=Image.Resampling.LANCZOS)
+        center = ImageOps.expand(center, border=10, fill=(245, 245, 245))
+        canvas.paste(center, ((1280 - center.width) // 2, (1280 - center.height) // 2))
+        final_image = _apply_frame_to_image(canvas, genre)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        tmp.close()
+        final_image.save(tmp.name, "PNG", optimize=True)
+        return tmp.name
+    finally:
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def send_ready_digest(digest: dict):
@@ -2321,48 +2713,25 @@ def send_ready_digest(digest: dict):
     thread_id = digest.get("thread_id") or digest.get("Thread ID")
     rows = digest.get("rows") or []
     genre = digest.get("genre") or digest.get("Genre") or ""
-
+    items = digest.get("items") or []
     if not chat_id:
         print("DIGEST SKIP: no chat_id", digest, flush=True)
         return
+    collage_path = ""
+    try:
+        collage_path = prepare_digest_collage(items, genre)
+        result = _send_draft_photo(chat_id, int(thread_id) if str(thread_id).isdigit() else thread_id, collage_path, build_digest_text(digest), genre)
+        message_id = result.get("message_id")
+        digest_link = build_telegram_message_link(chat_id, message_id) or "digest_sent"
+        mark_result = sheets_post_action("mark_digest_done", {"rows": ",".join([str(r) for r in rows]), "found_in": digest_link})
+        print("DIGEST COLLAGE SENT:", {"genre": genre, "chat_id": chat_id, "thread_id": thread_id, "rows": rows, "message_id": message_id, "digest_link": digest_link, "mark_result": mark_result}, flush=True)
+    finally:
+        if collage_path:
+            try:
+                os.remove(collage_path)
+            except OSError:
+                pass
 
-    text = build_digest_text(digest)
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-
-    if thread_id:
-        try:
-            payload["message_thread_id"] = int(thread_id)
-        except Exception:
-            pass
-
-    result = telegram_api_json("sendMessage", payload)
-    message_id = result.get("message_id")
-    digest_link = build_telegram_message_link(chat_id, message_id) or "digest_sent"
-
-    mark_result = sheets_post_action("mark_digest_done", {
-        "rows": ",".join([str(r) for r in rows]),
-        "found_in": digest_link,
-    })
-
-    print(
-        "DIGEST SENT:",
-        {
-            "genre": genre,
-            "chat_id": chat_id,
-            "thread_id": thread_id,
-            "rows": rows,
-            "message_id": message_id,
-            "digest_link": digest_link,
-            "mark_result": mark_result,
-        },
-        flush=True
-    )
 
 
 def run_digest_check_once():
@@ -2484,7 +2853,8 @@ def send_review_card(row_number, context: Optional[dict] = None):
         except Exception:
             pass
 
-    telegram_api_json("sendMessage", payload)
+    result = telegram_api_json("sendMessage", payload)
+    _schedule_result_cleanup(result)
 
 
 def handle_review_callback(callback: dict):
@@ -2517,7 +2887,8 @@ def handle_review_callback(callback: dict):
                     payload["message_thread_id"] = int(context.get("thread_id"))
                 except Exception:
                     pass
-            telegram_api_json("sendMessage", payload)
+            sent = telegram_api_json("sendMessage", payload)
+            _schedule_result_cleanup(sent)
 
         print("REVIEW MANUAL DONE:", {"row": row_number, "user": username, "result": result}, flush=True)
         return True
@@ -2634,6 +3005,10 @@ def telegram_webhook():
             flush=True
         )
         try:
+            if handle_draft_callback(callback):
+                return "ok", 200
+            if handle_pending_callback(callback):
+                return "ok", 200
             if handle_publish_callback(callback):
                 return "ok", 200
             if handle_review_callback(callback):
@@ -2668,10 +3043,10 @@ def telegram_webhook():
             print("EMOJI PACK COMMAND ERROR:", str(e), flush=True)
 
         try:
-            if handle_schedule_time_message(incoming_message):
+            if handle_editorial_menu_command(incoming_message):
                 return "ok", 200
         except Exception as e:
-            print("SCHEDULE TIME HANDLER ERROR:", str(e), flush=True)
+            print("EDITORIAL MENU COMMAND ERROR:", str(e), flush=True)
 
         try:
             send_predlozhka_to_sheets(incoming_message)
@@ -2709,4 +3084,5 @@ def telegram_webhook():
 
 if __name__ == "__main__":
     start_review_scheduler()
+    start_cleanup_scheduler()
     app.run(host="0.0.0.0", port=PORT)
