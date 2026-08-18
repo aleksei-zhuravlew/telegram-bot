@@ -10,7 +10,7 @@ import hmac
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl, unquote
 
 import requests
 from PIL import Image, ImageOps
@@ -1440,49 +1440,146 @@ def _is_usable_cover_url(value: str) -> bool:
 
 
 def extract_cover_download_url(post: dict) -> str:
-    """Find a REAL hyperlink attached to a line such as “скачать обложку”."""
-    text = get_post_text(post)
+    """
+    Find a real cover URL.
+
+    Priority:
+    1) Telegram text_link/url entity attached to the visible words
+       "скачать обложку";
+    2) visible URL on that service line;
+    3) safe direct image URL from Telegram entities as a fallback.
+
+    This is especially important for #сверхновые: they may arrive without an
+    attached photo, while PuzzleBot/ChtoMusicBot puts the real JPG behind the
+    clickable words "скачать обложку".
+    """
+    # IMPORTANT: entity offsets belong to the ORIGINAL Telegram text.
+    # Do not use get_post_text() here because it strips leading/trailing spaces.
+    text = post.get("text") or post.get("caption") or ""
     entities = post.get("entities") or post.get("caption_entities") or []
 
-    cursor = 0
-    for raw_line in text.splitlines(keepends=True):
-        visible = raw_line.rstrip("\r\n")
-        line_start = cursor
-        line_end = line_start + len(visible)
-        cursor += len(raw_line)
+    def entity_visible_text(entity: dict) -> str:
+        try:
+            start_index = _utf16_to_py_index(text, int(entity.get("offset", 0)))
+            end_index = _utf16_to_py_index(
+                text,
+                int(entity.get("offset", 0)) + int(entity.get("length", 0)),
+            )
+            return text[start_index:end_index]
+        except Exception:
+            return ""
 
+    def entity_url(entity: dict) -> str:
+        etype = entity.get("type")
+        if etype == "text_link":
+            return str(entity.get("url") or "").strip()
+        if etype == "url":
+            return entity_visible_text(entity).strip()
+        return ""
+
+    # 1) Best case: hidden URL is attached exactly to "скачать обложку".
+    for entity in entities:
+        visible = entity_visible_text(entity)
         if "скачать облож" not in visible.casefold():
             continue
 
-        # Prefer the URL embedded into the words “скачать обложку”.
+        candidate = entity_url(entity)
+        if _is_usable_cover_url(candidate):
+            print(
+                "COVER LINK FOUND:",
+                {
+                    "source": "telegram_entity_label",
+                    "message_id": post.get("message_id"),
+                    "url": candidate,
+                },
+                flush=True,
+            )
+            return candidate
+
+    # 2) Find the service line and any entity/visible URL located on it.
+    cursor = 0
+    for raw_line in text.splitlines(keepends=True):
+        visible_line = raw_line.rstrip("\r\n")
+        line_start = cursor
+        line_end = line_start + len(visible_line)
+        cursor += len(raw_line)
+
+        if "скачать облож" not in visible_line.casefold():
+            continue
+
         for entity in entities:
             try:
-                start = _utf16_to_py_index(text, int(entity.get("offset", 0)))
-                end = _utf16_to_py_index(
+                entity_start = _utf16_to_py_index(text, int(entity.get("offset", 0)))
+                entity_end = _utf16_to_py_index(
                     text,
                     int(entity.get("offset", 0)) + int(entity.get("length", 0)),
                 )
             except Exception:
                 continue
 
-            if start < line_start or end > line_end:
+            if entity_start < line_start or entity_end > line_end:
                 continue
 
-            if entity.get("type") == "text_link" and entity.get("url"):
-                candidate = str(entity["url"]).strip()
-                if _is_usable_cover_url(candidate):
-                    return candidate
-            if entity.get("type") == "url":
-                candidate = text[start:end].strip()
-                if _is_usable_cover_url(candidate):
-                    return candidate
+            candidate = entity_url(entity)
+            if _is_usable_cover_url(candidate):
+                print(
+                    "COVER LINK FOUND:",
+                    {
+                        "source": "telegram_entity_line",
+                        "message_id": post.get("message_id"),
+                        "url": candidate,
+                    },
+                    flush=True,
+                )
+                return candidate
 
-        # Fallback when the URL is printed visibly on the same line.
-        match = re.search(r"https?://[^\s<>\]\)\"']+", visible)
+        match = re.search(r"https?://[^\s<>\]\)\"']+", visible_line)
         if match:
             candidate = match.group(0).rstrip(".,;:!?")
             if _is_usable_cover_url(candidate):
+                print(
+                    "COVER LINK FOUND:",
+                    {
+                        "source": "visible_service_url",
+                        "message_id": post.get("message_id"),
+                        "url": candidate,
+                    },
+                    flush=True,
+                )
                 return candidate
+
+    # 3) Last safe fallback for text-only #сверхновые.
+    # Sometimes the producer bot changes the label, but the entity still points
+    # directly to an image in object storage. Accept only clearly image-like URLs.
+    for entity in entities:
+        candidate = entity_url(entity)
+        if not _is_usable_cover_url(candidate):
+            continue
+
+        decoded = unquote(candidate)
+        low = decoded.casefold()
+        parsed = urlparse(decoded)
+        host = (parsed.netloc or "").casefold()
+        path = (parsed.path or "").casefold()
+
+        image_like = bool(re.search(r"\.(?:jpe?g|png|webp)(?:$|[?#])", low))
+        known_object_storage = (
+            host.endswith("storage.yandexcloud.net")
+            or host.endswith("storage.googleapis.com")
+            or host.endswith("amazonaws.com")
+        )
+
+        if image_like or known_object_storage:
+            print(
+                "COVER LINK FOUND:",
+                {
+                    "source": "image_entity_fallback",
+                    "message_id": post.get("message_id"),
+                    "url": candidate,
+                },
+                flush=True,
+            )
+            return candidate
 
     return ""
 
