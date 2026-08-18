@@ -2129,68 +2129,109 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
         print("EDITORIAL DRAFT EXACT MESSAGE:", {"key": key, "row": row_number, "message_id": post.get("message_id")}, flush=True)
         return direct
 
-    # Pairing supports BOTH delivery orders:
-    #   text -> cover
-    #   cover -> text
-    # while still refusing to reuse an old unrelated cover.
+    # STRICT REVIEW PAIRING:
+    # Never pair parts merely because they are close in time/message_id.
+    # The old "cover-first within 3 messages / 5 minutes" heuristic could reuse
+    # the previous review's cover for the next review, producing a wrong draft
+    # first and the correct draft only after the real new cover arrived.
+    #
+    # Sheet row is the review identity. If rows differ, cached parts are discarded.
     with editorial_draft_parts_lock:
         _prune_editorial_draft_parts(now_value)
 
+        previous = editorial_draft_parts.get(key) or {}
+        previous_row = previous.get("sheet_row")
+
+        row_mismatch = bool(
+            row_number
+            and previous_row
+            and str(row_number) != str(previous_row)
+        )
+
+        if row_mismatch:
+            print(
+                "EDITORIAL CACHE RESET ROW MISMATCH:",
+                {
+                    "key": key,
+                    "cached_row": previous_row,
+                    "incoming_row": row_number,
+                    "message_id": post.get("message_id"),
+                    "incoming_text": incoming_text,
+                    "incoming_cover": incoming_cover,
+                },
+                flush=True,
+            )
+            previous = {}
+            editorial_draft_parts.pop(key, None)
+
         if incoming_text:
-            previous = editorial_draft_parts.get(key) or {}
-            previous_cover = previous.get("cover_post")
-            keep_previous_cover = False
-
-            if previous_cover:
-                try:
-                    cover_mid = int(previous_cover.get("message_id") or 0)
-                    text_mid = int(post.get("message_id") or 0)
-                except Exception:
-                    cover_mid = 0
-                    text_mid = 0
-
-                age_sec = now_value - float(previous.get("updated_at") or 0)
-
-                # A standalone image sent immediately BEFORE its review text is
-                # considered the same review. Restrict by time + message distance
-                # so an old cover can never leak into a later review.
-                keep_previous_cover = (
-                    0 <= age_sec <= 300
-                    and cover_mid > 0
-                    and text_mid > cover_mid
-                    and (text_mid - cover_mid) <= 3
-                )
-
+            # A new text message starts/refreshes the review identity.
+            # Preserve a cached cover ONLY when it is explicitly tied to the
+            # exact same sheet row. Never carry a cover from an unknown/old row.
             entry = {
                 "updated_at": now_value,
                 "text_post": post,
                 "sheet_row": row_number,
             }
-            if keep_previous_cover:
+
+            previous_cover = previous.get("cover_post")
+            previous_cover_row = (
+                (previous_cover or {}).get("_editorial_sheet_row")
+                or previous.get("sheet_row")
+            )
+
+            if (
+                previous_cover
+                and row_number
+                and previous_cover_row
+                and str(row_number) == str(previous_cover_row)
+            ):
                 entry["cover_post"] = previous_cover
                 print(
-                    "EDITORIAL COVER-FIRST PAIR:",
+                    "EDITORIAL SAME-ROW COVER REUSED:",
                     {
                         "key": key,
+                        "row": row_number,
                         "cover_message_id": previous_cover.get("message_id"),
                         "text_message_id": post.get("message_id"),
-                        "age_sec": round(age_sec, 2),
                     },
                     flush=True,
                 )
 
             editorial_draft_parts[key] = entry
         else:
-            entry = editorial_draft_parts.setdefault(key, {"updated_at": now_value})
+            entry = editorial_draft_parts.setdefault(
+                key,
+                {
+                    "updated_at": now_value,
+                    "sheet_row": row_number,
+                },
+            )
+
+            # If this is a cover tied to a row, never leave stale text from
+            # another/unknown review in the entry.
+            if incoming_cover and row_number:
+                entry_row = entry.get("sheet_row")
+                if entry_row and str(entry_row) != str(row_number):
+                    entry = {
+                        "updated_at": now_value,
+                        "sheet_row": row_number,
+                    }
+                    editorial_draft_parts[key] = entry
 
         replied = post.get("reply_to_message") or {}
         if replied and _is_trusted_editorial_sender(replied) and _has_meaningful_publish_text(replied):
-            entry["text_post"] = replied
+            replied_row = replied.get("_editorial_sheet_row")
+            if not row_number or not replied_row or str(row_number) == str(replied_row):
+                entry["text_post"] = replied
 
         if incoming_cover:
+            # Cover is safe to cache only under its own resolved row identity.
             entry["cover_post"] = post
+
         if row_number:
             entry["sheet_row"] = row_number
+
         entry["updated_at"] = now_value
 
         text_post = entry.get("text_post")
@@ -2259,6 +2300,23 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
         print(
             "EDITORIAL DRAFT WAITING FOR PART:",
             {"key": key, "genre": genre, "sheet_row": row_number, "has_text": bool(text_post), "has_cover": bool(cover_post)},
+            flush=True,
+        )
+        return post
+
+    # Last safety gate: if both parts carry sheet-row identity, they MUST match.
+    text_row = text_post.get("_editorial_sheet_row") or row_number
+    cover_row = cover_post.get("_editorial_sheet_row") or row_number
+    if text_row and cover_row and str(text_row) != str(cover_row):
+        print(
+            "EDITORIAL DRAFT BLOCKED ROW MISMATCH:",
+            {
+                "key": key,
+                "text_row": text_row,
+                "cover_row": cover_row,
+                "text_message_id": text_post.get("message_id"),
+                "cover_message_id": cover_post.get("message_id"),
+            },
             flush=True,
         )
         return post
