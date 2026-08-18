@@ -3533,6 +3533,209 @@ def _digest_cover_source(item: dict) -> str:
     return ""
 
 
+def recover_digest_cover_from_source_message(
+    item: dict,
+    chat_id,
+    thread_id=None,
+) -> bool:
+    """
+    Recover an OLD #сверхновые cover from its original Telegram message.
+
+    Strategy:
+      1) silently forward the old source message to the same topic;
+      2) inspect the returned Message object;
+      3) recover photo file_id or the hidden "скачать обложку" URL;
+      4) save the recovered cover to the exact Predlozhka row;
+      5) immediately delete the temporary forwarded message.
+
+    Recovery failure never blocks the digest; the collage can still use
+    its placeholder tile.
+    """
+    row_number = item.get("row") or item.get("Row")
+    source_message_id = item.get("message_id") or item.get("Message ID")
+
+    existing_file_id = str(
+        item.get("cover_file_id")
+        or item.get("Cover File ID")
+        or ""
+    ).strip()
+    existing_cover_url = str(
+        item.get("cover_url")
+        or item.get("Cover URL")
+        or ""
+    ).strip()
+
+    if existing_file_id or existing_cover_url:
+        return True
+
+    if not row_number or not chat_id or not source_message_id:
+        print(
+            "DIGEST COVER RECOVERY SKIP:",
+            {
+                "row": row_number,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "message_id": source_message_id,
+                "reason": "missing row/chat/message_id",
+            },
+            flush=True,
+        )
+        return False
+
+    forward_payload = {
+        "chat_id": chat_id,
+        "from_chat_id": chat_id,
+        "message_id": int(source_message_id),
+        "disable_notification": True,
+    }
+    if thread_id:
+        try:
+            forward_payload["message_thread_id"] = int(thread_id)
+        except Exception:
+            forward_payload["message_thread_id"] = thread_id
+
+    forwarded = None
+    try:
+        forwarded = telegram_api_json("forwardMessage", forward_payload)
+
+        recovered_file_id = extract_image_file_id(forwarded) or ""
+        recovered_cover_url = extract_cover_download_url(forwarded) or ""
+
+        if not recovered_file_id and not recovered_cover_url:
+            print(
+                "DIGEST COVER RECOVERY NOT FOUND:",
+                {
+                    "row": row_number,
+                    "source_message_id": source_message_id,
+                    "forwarded_message_id": forwarded.get("message_id"),
+                },
+                flush=True,
+            )
+            return False
+
+        save_result = sheets_post_action(
+            "attach_cover_to_recent",
+            {
+                "sheet": PREDLOZHKA_SHEET_NAME,
+                "chat_id": str(chat_id),
+                "thread_id": str(thread_id or ""),
+                "cover_file_id": recovered_file_id,
+                "cover_url": recovered_cover_url,
+                "preferred_row": str(row_number),
+                "cover_message_id": str(forwarded.get("message_id") or ""),
+                "reply_to_message_id": str(source_message_id),
+            },
+        )
+
+        if save_result.get("status") != "ok":
+            print(
+                "DIGEST COVER RECOVERY SAVE FAILED:",
+                {
+                    "row": row_number,
+                    "source_message_id": source_message_id,
+                    "result": save_result,
+                },
+                flush=True,
+            )
+            return False
+
+        # Use the recovered cover immediately in this same digest run.
+        if recovered_file_id:
+            item["cover_file_id"] = recovered_file_id
+        if recovered_cover_url:
+            item["cover_url"] = recovered_cover_url
+
+        print(
+            "DIGEST COVER RECOVERED:",
+            {
+                "row": row_number,
+                "source_message_id": source_message_id,
+                "forwarded_message_id": forwarded.get("message_id"),
+                "has_file_id": bool(recovered_file_id),
+                "has_cover_url": bool(recovered_cover_url),
+                "save_result": save_result,
+            },
+            flush=True,
+        )
+        return True
+
+    except Exception as e:
+        print(
+            "DIGEST COVER RECOVERY ERROR:",
+            {
+                "row": row_number,
+                "source_message_id": source_message_id,
+                "error": str(e),
+            },
+            flush=True,
+        )
+        return False
+
+    finally:
+        if forwarded and forwarded.get("message_id"):
+            try:
+                telegram_api_json(
+                    "deleteMessage",
+                    {
+                        "chat_id": chat_id,
+                        "message_id": int(forwarded.get("message_id")),
+                    },
+                )
+                print(
+                    "DIGEST COVER RECOVERY TEMP DELETED:",
+                    {
+                        "row": row_number,
+                        "message_id": forwarded.get("message_id"),
+                    },
+                    flush=True,
+                )
+            except Exception as delete_error:
+                print(
+                    "DIGEST COVER RECOVERY TEMP DELETE ERROR:",
+                    {
+                        "row": row_number,
+                        "message_id": forwarded.get("message_id"),
+                        "error": str(delete_error),
+                    },
+                    flush=True,
+                )
+
+
+def recover_missing_digest_covers(digest: dict) -> dict:
+    """
+    Repair missing covers for digest items before collage build.
+    """
+    chat_id = digest.get("chat_id") or digest.get("Chat ID")
+    thread_id = digest.get("thread_id") or digest.get("Thread ID")
+    items = digest.get("items") or []
+
+    attempted = 0
+    recovered = 0
+    still_missing = []
+
+    for item in items:
+        has_cover = bool(
+            str(item.get("cover_file_id") or item.get("Cover File ID") or "").strip()
+            or str(item.get("cover_url") or item.get("Cover URL") or "").strip()
+        )
+        if has_cover:
+            continue
+
+        attempted += 1
+        if recover_digest_cover_from_source_message(item, chat_id, thread_id):
+            recovered += 1
+        else:
+            still_missing.append(item.get("row") or item.get("Row"))
+
+    result = {
+        "attempted": attempted,
+        "recovered": recovered,
+        "still_missing_rows": still_missing,
+    }
+    print("DIGEST COVER RECOVERY RESULT:", result, flush=True)
+    return result
+
+
 def _digest_placeholder_image() -> Image.Image:
     return Image.new("RGB", (720, 720), (28, 28, 28))
 
@@ -3597,6 +3800,10 @@ def send_ready_digest(digest: dict):
     if not chat_id:
         print("DIGEST SKIP: no chat_id", digest, flush=True)
         return
+
+    # Recover old missing covers before building the collage.
+    recovery_result = recover_missing_digest_covers(digest)
+
     collage_path = ""
     try:
         collage_path = prepare_digest_collage(items, genre)
@@ -3604,7 +3811,20 @@ def send_ready_digest(digest: dict):
         message_id = result.get("message_id")
         digest_link = build_telegram_message_link(chat_id, message_id) or "digest_sent"
         mark_result = sheets_post_action("mark_digest_done", {"rows": ",".join([str(r) for r in rows]), "found_in": digest_link})
-        print("DIGEST COLLAGE SENT:", {"genre": genre, "chat_id": chat_id, "thread_id": thread_id, "rows": rows, "message_id": message_id, "digest_link": digest_link, "mark_result": mark_result}, flush=True)
+        print(
+            "DIGEST COLLAGE SENT:",
+            {
+                "genre": genre,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "rows": rows,
+                "message_id": message_id,
+                "digest_link": digest_link,
+                "cover_recovery": recovery_result,
+                "mark_result": mark_result,
+            },
+            flush=True,
+        )
     finally:
         if collage_path:
             try:
