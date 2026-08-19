@@ -3798,11 +3798,48 @@ def _apply_frame_to_image(base: Image.Image, genre: str) -> Image.Image:
     return result
 
 
+def _is_rock_digest_genre(genre: str) -> bool:
+    """Rock-only digest switch. Other genres keep the existing 5-cover layout."""
+    normalized = str(genre or "").strip().casefold().replace("ё", "е")
+    return normalized in {
+        "rock",
+        "рок",
+        "chto_music_rock",
+        "@chto_music_rock",
+    }
+
+
+def _paste_rock_digest_grid(canvas: Image.Image, covers: List[Image.Image]) -> None:
+    """
+    Rock digest: 9 equal covers in a clean 3x3 grid.
+    The existing rock frame is applied after the grid.
+    """
+    canvas_size = 1280
+    bounds = [round(i * canvas_size / 3) for i in range(4)]
+
+    for index, image in enumerate(covers[:9]):
+        row = index // 3
+        col = index % 3
+        x0, x1 = bounds[col], bounds[col + 1]
+        y0, y1 = bounds[row], bounds[row + 1]
+
+        fitted = ImageOps.fit(
+            image,
+            (x1 - x0, y1 - y0),
+            method=Image.Resampling.LANCZOS,
+        )
+        canvas.paste(fitted, (x0, y0))
+
+
 def prepare_digest_collage(items: List[dict], genre: str) -> str:
     paths = []
     covers = []
+
+    is_rock = _is_rock_digest_genre(genre)
+    required_covers = 9 if is_rock else 5
+
     try:
-        for item in (items or [])[:5]:
+        for item in (items or [])[:required_covers]:
             try:
                 path = _digest_cover_source(item)
                 if path:
@@ -3812,21 +3849,72 @@ def prepare_digest_collage(items: List[dict], genre: str) -> str:
                 else:
                     covers.append(_digest_placeholder_image())
             except Exception as e:
-                print("DIGEST COVER ERROR:", {"item": item.get("row"), "error": str(e)}, flush=True)
+                print(
+                    "DIGEST COVER ERROR:",
+                    {"item": item.get("row"), "error": str(e)},
+                    flush=True,
+                )
                 covers.append(_digest_placeholder_image())
-        while len(covers) < 5:
+
+        while len(covers) < required_covers:
             covers.append(_digest_placeholder_image())
+
         canvas = Image.new("RGB", (1280, 1280), (20, 20, 20))
-        for image, pos in zip(covers[:4], [(0, 0), (580, 0), (0, 580), (580, 580)]):
-            canvas.paste(ImageOps.fit(image, (700, 700), method=Image.Resampling.LANCZOS), pos)
-        center = ImageOps.fit(covers[4], (650, 650), method=Image.Resampling.LANCZOS)
-        center = ImageOps.expand(center, border=10, fill=(245, 245, 245))
-        canvas.paste(center, ((1280 - center.width) // 2, (1280 - center.height) // 2))
+
+        if is_rock:
+            # ROCK ONLY: 9 covers, equal 3x3 grid.
+            _paste_rock_digest_grid(canvas, covers)
+            print(
+                "DIGEST COLLAGE LAYOUT:",
+                {"genre": genre, "layout": "3x3", "covers": 9},
+                flush=True,
+            )
+        else:
+            # ALL OTHER GENRES: preserve the previous 5-cover composition.
+            for image, pos in zip(
+                covers[:4],
+                [(0, 0), (580, 0), (0, 580), (580, 580)],
+            ):
+                canvas.paste(
+                    ImageOps.fit(
+                        image,
+                        (700, 700),
+                        method=Image.Resampling.LANCZOS,
+                    ),
+                    pos,
+                )
+
+            center = ImageOps.fit(
+                covers[4],
+                (650, 650),
+                method=Image.Resampling.LANCZOS,
+            )
+            center = ImageOps.expand(
+                center,
+                border=10,
+                fill=(245, 245, 245),
+            )
+            canvas.paste(
+                center,
+                (
+                    (1280 - center.width) // 2,
+                    (1280 - center.height) // 2,
+                ),
+            )
+            print(
+                "DIGEST COLLAGE LAYOUT:",
+                {"genre": genre, "layout": "legacy_5", "covers": 5},
+                flush=True,
+            )
+
+        # Existing genre-frame logic remains unchanged.
         final_image = _apply_frame_to_image(canvas, genre)
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
         tmp.close()
         final_image.save(tmp.name, "PNG", optimize=True)
         return tmp.name
+
     finally:
         for path in paths:
             try:
