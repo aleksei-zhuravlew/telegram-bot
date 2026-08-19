@@ -3524,12 +3524,56 @@ def build_digest_text(digest: dict) -> str:
 
 
 def _digest_cover_source(item: dict) -> str:
+    """
+    Pick the cover for one #сверхновые item.
+
+    Prefer Cover URL over Telegram Cover File ID.
+
+    Old rows may still contain a stale/wrong File ID from an earlier attachment
+    match, while the exact "скачать обложку" URL has already been recovered and
+    stored correctly in Google Sheets. If File ID wins, two different releases
+    can accidentally render the same old Telegram image in the collage.
+
+    The recovered Cover URL is tied to the exact source-message row, so it is
+    the safer source whenever it exists. File ID remains a fallback for releases
+    that arrived as a real Telegram photo and have no URL.
+    """
+    row_number = item.get("row") or item.get("Row")
     file_id = str(item.get("cover_file_id") or item.get("Cover File ID") or "").strip()
     cover_url = str(item.get("cover_url") or item.get("Cover URL") or "").strip()
-    if file_id:
-        return tg_download_file(file_id)
+
     if cover_url:
+        print(
+            "DIGEST COVER SOURCE:",
+            {
+                "row": row_number,
+                "source": "cover_url",
+                "has_file_id": bool(file_id),
+            },
+            flush=True,
+        )
         return download_cover_from_url(cover_url)
+
+    if file_id:
+        print(
+            "DIGEST COVER SOURCE:",
+            {
+                "row": row_number,
+                "source": "telegram_file_id",
+                "has_cover_url": False,
+            },
+            flush=True,
+        )
+        return tg_download_file(file_id)
+
+    print(
+        "DIGEST COVER SOURCE:",
+        {
+            "row": row_number,
+            "source": "missing",
+        },
+        flush=True,
+    )
     return ""
 
 
