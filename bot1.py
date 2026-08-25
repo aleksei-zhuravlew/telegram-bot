@@ -76,6 +76,13 @@ AUTOPUBLISH_CHECK_INTERVAL_SEC = int(os.environ.get("AUTOPUBLISH_CHECK_INTERVAL_
 AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")  # legacy fallback; Sheets is used for new schedules
 GENRE_FRAME_DIR = os.environ.get("GENRE_FRAME_DIR", "genre_frames")
 
+# Remove the thin noisy/white fringe that can be baked into the inner edge
+# of transparent PNG frames. 3 px is intentionally conservative.
+FRAME_EDGE_CLEANUP_PX = max(
+    0,
+    int(os.environ.get("FRAME_EDGE_CLEANUP_PX", "3")),
+)
+
 # Telegram native copy_text is limited to 256 characters. Long editorial reviews
 # use a signed copy page hosted by this same Render web service.
 EDITORIAL_COPY_BASE_URL = (
@@ -1639,6 +1646,116 @@ def download_cover_from_url(url: str) -> str:
     return tmp.name
 
 
+def _clean_frame_inner_edge(frame: Image.Image, cleanup_px: int = None) -> Image.Image:
+    """
+    Remove the tiny white/noisy fringe along the INNER edge of a transparent
+    channel frame.
+
+    Our frame PNGs have a transparent photo window in the middle. Some source
+    frame files contain a 1-3 px anti-aliased / light fringe on the boundary of
+    that window. Because it belongs to the frame itself, placing the photo
+    underneath cannot hide it.
+
+    We detect the transparent center window from the alpha channel and expand
+    that transparent window a few pixels into the frame. Only the inner edge is
+    touched; the outer border and its artwork remain unchanged.
+    """
+    result = frame.convert("RGBA")
+    cleanup = FRAME_EDGE_CLEANUP_PX if cleanup_px is None else max(0, int(cleanup_px))
+
+    if cleanup <= 0:
+        return result
+
+    alpha = result.getchannel("A")
+    width, height = result.size
+    cx, cy = width // 2, height // 2
+    pixels = alpha.load()
+
+    # A normal genre frame must have a transparent center where the photo shows.
+    transparent_threshold = 24
+    if pixels[cx, cy] > transparent_threshold:
+        print(
+            "FRAME EDGE CLEANUP SKIP:",
+            {
+                "reason": "center_not_transparent",
+                "size": result.size,
+                "center_alpha": pixels[cx, cy],
+            },
+            flush=True,
+        )
+        return result
+
+    # Walk from the transparent center toward each side until the actual frame
+    # begins. A noisy white fringe counts as frame here, which is exactly what
+    # we want to trim away.
+    left = cx
+    while left > 0 and pixels[left, cy] <= transparent_threshold:
+        left -= 1
+
+    right = cx
+    while right < width - 1 and pixels[right, cy] <= transparent_threshold:
+        right += 1
+
+    top = cy
+    while top > 0 and pixels[cx, top] <= transparent_threshold:
+        top -= 1
+
+    bottom = cy
+    while bottom < height - 1 and pixels[cx, bottom] <= transparent_threshold:
+        bottom += 1
+
+    # Guard against an unexpected alpha layout.
+    if not (left < cx < right and top < cy < bottom):
+        print(
+            "FRAME EDGE CLEANUP SKIP:",
+            {
+                "reason": "window_not_detected",
+                "size": result.size,
+                "edges": [left, top, right, bottom],
+            },
+            flush=True,
+        )
+        return result
+
+    # Expand the transparent photo window *into* the frame by a few pixels.
+    # This removes the baked-in white sparkle/noise without altering the rest
+    # of the frame.
+    clear_left = max(0, left - cleanup + 1)
+    clear_top = max(0, top - cleanup + 1)
+    clear_right = min(width, right + cleanup)
+    clear_bottom = min(height, bottom + cleanup)
+
+    alpha.paste(
+        0,
+        (clear_left, clear_top, clear_right, clear_bottom),
+    )
+    result.putalpha(alpha)
+
+    print(
+        "FRAME EDGE CLEANUP:",
+        {
+            "px": cleanup,
+            "size": result.size,
+            "window": [clear_left, clear_top, clear_right, clear_bottom],
+        },
+        flush=True,
+    )
+    return result
+
+
+def _prepare_genre_frame(frame_source: Image.Image, target_size) -> Image.Image:
+    """
+    Normalize a genre frame for compositing and clean its inner alpha edge.
+
+    Frames in the repo are already 1280x1280 in normal operation. If a frame
+    ever has a different size, resize it only once here, then clean the edge.
+    """
+    frame = frame_source.convert("RGBA")
+    if frame.size != target_size:
+        frame = frame.resize(target_size, Image.Resampling.LANCZOS)
+    return _clean_frame_inner_edge(frame)
+
+
 def prepare_framed_cover(source_path: str, genre: str) -> str:
     """Create a 1280x1280 cover and apply the genre PNG frame when configured."""
     with Image.open(source_path) as source:
@@ -1648,13 +1765,16 @@ def prepare_framed_cover(source_path: str, genre: str) -> str:
     frame_path = resolve_frame_path(genre)
     if frame_path:
         with Image.open(frame_path) as frame_source:
-            frame = frame_source.convert("RGBA")
-            if frame.size != (1280, 1280):
-                frame = frame.resize((1280, 1280), Image.Resampling.LANCZOS)
+            frame = _prepare_genre_frame(frame_source, (1280, 1280))
             result = Image.alpha_composite(result, frame)
             print(
                 "AUTOPUBLISH FRAME APPLIED:",
-                {"genre": genre, "frame_path": frame_path, "source_path": source_path},
+                {
+                    "genre": genre,
+                    "frame_path": frame_path,
+                    "source_path": source_path,
+                    "edge_cleanup_px": FRAME_EDGE_CLEANUP_PX,
+                },
                 flush=True,
             )
     elif genre in GENRE_FRAME_FILES:
@@ -2193,6 +2313,68 @@ def _recover_draft_parts_from_sheet(row_number, current_post: dict):
     return text_post, cover_post
 
 
+def _can_adopt_unclaimed_cover_first(
+    previous: dict,
+    incoming_text_post: dict,
+    row_number,
+    now_value: float,
+) -> bool:
+    """
+    Safe cover-first exception for PuzzleBot/ChtoMusicBot review delivery.
+
+    In some topics (notably Главред), Telegram sends:
+        1) standalone cover photo
+        2) review text immediately after it
+
+    The cover arrives before the Predlozhka row exists, so it has no sheet_row.
+    Strict same-row pairing must normally reject such an "unknown" cover.
+
+    We adopt it ONLY when all of the following are true:
+    - cached entry has a cover but no text and no resolved sheet row;
+    - cover sender is our trusted editorial bot;
+    - incoming text already has its newly created sheet row;
+    - text message_id is exactly cover message_id + 1;
+    - parts arrived within 90 seconds.
+
+    This does NOT restore the old loose "within 3 messages / 5 minutes" heuristic.
+    """
+    if not previous or not row_number:
+        return False
+
+    if previous.get("text_post"):
+        return False
+
+    cover_post = previous.get("cover_post")
+    if not cover_post:
+        return False
+
+    if previous.get("sheet_row") or cover_post.get("_editorial_sheet_row"):
+        return False
+
+    if not _is_trusted_editorial_sender(cover_post):
+        return False
+
+    if not (_post_has_cover_source(cover_post) or cover_post.get("_editorial_cover_url")):
+        return False
+
+    try:
+        cover_mid = int(cover_post.get("message_id") or 0)
+        text_mid = int(incoming_text_post.get("message_id") or 0)
+    except Exception:
+        return False
+
+    if cover_mid <= 0 or text_mid != cover_mid + 1:
+        return False
+
+    try:
+        age_sec = float(now_value) - float(previous.get("updated_at") or now_value)
+    except Exception:
+        return False
+
+    return 0 <= age_sec <= 90
+
+
+
 def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
     """Pair only the text and cover that belong to the same review."""
     if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
@@ -2290,6 +2472,28 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
                         "key": key,
                         "row": row_number,
                         "cover_message_id": previous_cover.get("message_id"),
+                        "text_message_id": post.get("message_id"),
+                    },
+                    flush=True,
+                )
+
+            elif _can_adopt_unclaimed_cover_first(
+                previous,
+                post,
+                row_number,
+                now_value,
+            ):
+                # The exact cover-first case used by Главред:
+                # cover 4936 -> text 4937 -> new row 359, for example.
+                adopted_cover = dict(previous_cover)
+                adopted_cover["_editorial_sheet_row"] = row_number
+                entry["cover_post"] = adopted_cover
+                print(
+                    "EDITORIAL COVER-FIRST ADOPTED:",
+                    {
+                        "key": key,
+                        "row": row_number,
+                        "cover_message_id": adopted_cover.get("message_id"),
                         "text_message_id": post.get("message_id"),
                     },
                     flush=True,
@@ -2399,7 +2603,7 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
             {"key": key, "genre": genre, "sheet_row": row_number, "has_text": bool(text_post), "has_cover": bool(cover_post)},
             flush=True,
         )
-        return post
+        return None
 
     # Last safety gate: if both parts carry sheet-row identity, they MUST match.
     text_row = text_post.get("_editorial_sheet_row") or row_number
@@ -2416,7 +2620,7 @@ def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
             },
             flush=True,
         )
-        return post
+        return None
 
     combined = dict(cover_post)
     combined["chat"] = post.get("chat") or cover_post.get("chat") or text_post.get("chat") or {}
@@ -2517,6 +2721,8 @@ def attach_cover_to_recent_sheet_row(post: dict) -> bool:
         return True
 
 def should_build_publish_preview(post: dict) -> bool:
+    if not post:
+        return False
     if not AUTOPUBLISH_PREVIEW_ENABLED:
         return False
     if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
@@ -3789,9 +3995,7 @@ def _apply_frame_to_image(base: Image.Image, genre: str) -> Image.Image:
     frame_path = resolve_frame_path(genre)
     if frame_path:
         with Image.open(frame_path) as frame_source:
-            frame = frame_source.convert("RGBA")
-            if frame.size != result.size:
-                frame = frame.resize(result.size, Image.Resampling.LANCZOS)
+            frame = _prepare_genre_frame(frame_source, result.size)
             result = Image.alpha_composite(result, frame)
     elif genre in GENRE_FRAME_FILES:
         raise RuntimeError(f"Не найдена рамка для жанра {genre}: {GENRE_FRAME_FILES.get(genre)}")
