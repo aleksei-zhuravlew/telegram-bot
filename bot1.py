@@ -212,6 +212,7 @@ AUTHOR_EMOJI_MAP = {
 # Custom emoji pack used by the editorial team.
 # Telegram link: https://t.me/addemoji/ChtoMusicTeam
 CUSTOM_EMOJI_PACK_NAME = os.environ.get("CUSTOM_EMOJI_PACK_NAME", "ChtoMusicTeam").strip() or "ChtoMusicTeam"
+EMOJIPACK_MAX_ITEMS = max(1, int(os.environ.get("EMOJIPACK_MAX_ITEMS", "40")))
 
 # In-memory state for the short dialogue after pressing “Опубликовать позже”.
 # Scheduled jobs themselves are also saved to AUTOPUBLISH_STORE_PATH.
@@ -833,9 +834,18 @@ def handle_emojipack_command(post: dict) -> bool:
         stickers = sticker_set.get("stickers") or []
 
         rows = []
+        total_custom_emoji = 0
+        seen_custom_emoji_ids = set()
+
         for index, sticker in enumerate(stickers, start=1):
             custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
-            if not custom_emoji_id:
+            if not custom_emoji_id or custom_emoji_id in seen_custom_emoji_ids:
+                continue
+
+            seen_custom_emoji_ids.add(custom_emoji_id)
+            total_custom_emoji += 1
+
+            if len(rows) >= EMOJIPACK_MAX_ITEMS:
                 continue
 
             visible = str(sticker.get("emoji") or "🙂")
@@ -860,17 +870,29 @@ def handle_emojipack_command(post: dict) -> bool:
         header = [
             f"<b>Набор:</b> {html_escape(title)}",
             f"<b>Имя:</b> <code>{html_escape(pack_name)}</code>",
-            f"<b>Найдено custom emoji:</b> {len(rows)}",
+            f"<b>Найдено custom emoji:</b> {total_custom_emoji}",
+            f"<b>Показано:</b> {len(rows)} из {total_custom_emoji}",
             "",
         ]
 
         if not rows:
             header.append("В этом наборе Bot API не вернул custom_emoji_id.")
+        elif total_custom_emoji > len(rows):
+            header.append(
+                f"⚠️ Список ограничен первыми {len(rows)} emoji, чтобы бот не отправлял сотни сообщений подряд."
+            )
+            header.append("")
 
         _send_emojipack_lines(chat_id, header + rows, thread_id)
         print(
             "EMOJI PACK LOADED:",
-            {"pack": pack_name, "title": title, "count": len(rows)},
+            {
+                "pack": pack_name,
+                "title": title,
+                "count_total": total_custom_emoji,
+                "count_sent": len(rows),
+                "limit": EMOJIPACK_MAX_ITEMS,
+            },
             flush=True,
         )
     except Exception as e:
