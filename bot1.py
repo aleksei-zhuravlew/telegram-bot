@@ -65,6 +65,10 @@ DIGEST_ENGINE_ENABLED = os.environ.get(
 ) == "1"
 DIGEST_SIZE = int(os.environ.get("DIGEST_SIZE", "5"))
 
+MONTHLY_STATS_ENABLED = os.environ.get("MONTHLY_STATS_ENABLED", "1") == "1"
+MONTHLY_STATS_CHAT_ID = os.environ.get("MONTHLY_STATS_CHAT_ID", "-1003533638771").strip()
+MONTHLY_STATS_THREAD_ID = os.environ.get("MONTHLY_STATS_THREAD_ID", "").strip()
+
 
 # ======================
 # AUTOPUBLISH PREVIEW — SAFE MVP
@@ -212,7 +216,6 @@ AUTHOR_EMOJI_MAP = {
 # Custom emoji pack used by the editorial team.
 # Telegram link: https://t.me/addemoji/ChtoMusicTeam
 CUSTOM_EMOJI_PACK_NAME = os.environ.get("CUSTOM_EMOJI_PACK_NAME", "ChtoMusicTeam").strip() or "ChtoMusicTeam"
-EMOJIPACK_MAX_ITEMS = max(1, int(os.environ.get("EMOJIPACK_MAX_ITEMS", "40")))
 
 # In-memory state for the short dialogue after pressing “Опубликовать позже”.
 # Scheduled jobs themselves are also saved to AUTOPUBLISH_STORE_PATH.
@@ -834,18 +837,9 @@ def handle_emojipack_command(post: dict) -> bool:
         stickers = sticker_set.get("stickers") or []
 
         rows = []
-        total_custom_emoji = 0
-        seen_custom_emoji_ids = set()
-
         for index, sticker in enumerate(stickers, start=1):
             custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
-            if not custom_emoji_id or custom_emoji_id in seen_custom_emoji_ids:
-                continue
-
-            seen_custom_emoji_ids.add(custom_emoji_id)
-            total_custom_emoji += 1
-
-            if len(rows) >= EMOJIPACK_MAX_ITEMS:
+            if not custom_emoji_id:
                 continue
 
             visible = str(sticker.get("emoji") or "🙂")
@@ -870,29 +864,17 @@ def handle_emojipack_command(post: dict) -> bool:
         header = [
             f"<b>Набор:</b> {html_escape(title)}",
             f"<b>Имя:</b> <code>{html_escape(pack_name)}</code>",
-            f"<b>Найдено custom emoji:</b> {total_custom_emoji}",
-            f"<b>Показано:</b> {len(rows)} из {total_custom_emoji}",
+            f"<b>Найдено custom emoji:</b> {len(rows)}",
             "",
         ]
 
         if not rows:
             header.append("В этом наборе Bot API не вернул custom_emoji_id.")
-        elif total_custom_emoji > len(rows):
-            header.append(
-                f"⚠️ Список ограничен первыми {len(rows)} emoji, чтобы бот не отправлял сотни сообщений подряд."
-            )
-            header.append("")
 
         _send_emojipack_lines(chat_id, header + rows, thread_id)
         print(
             "EMOJI PACK LOADED:",
-            {
-                "pack": pack_name,
-                "title": title,
-                "count_total": total_custom_emoji,
-                "count_sent": len(rows),
-                "limit": EMOJIPACK_MAX_ITEMS,
-            },
+            {"pack": pack_name, "title": title, "count": len(rows)},
             flush=True,
         )
     except Exception as e:
@@ -4230,6 +4212,110 @@ def run_review_check_once():
         print("REVIEW CHECK ERROR:", str(e), flush=True)
 
 
+def build_monthly_stats_text(report: dict) -> str:
+    month_name = str(report.get("month_name") or report.get("month") or "").strip()
+    year = str(report.get("year") or "").strip()
+    total = int(report.get("total") or 0)
+
+    title = f"📊 <b>Итоги редакции — {html_escape(month_name)}"
+    if year:
+        title += f" {html_escape(year)}"
+    title += "</b>"
+
+    lines = [title, "", f"Всего постов: <b>{total}</b>", "", "<b>По каналам:</b>"]
+
+    channels = report.get("channels") or []
+    if channels:
+        for item in channels:
+            label = str(item.get("label") or item.get("channel") or "Без канала")
+            count = int(item.get("count") or 0)
+            lines.append(f"• {html_escape(label)} — <b>{count}</b>")
+    else:
+        lines.append("• нет данных")
+
+    lines.extend(["", "<b>По авторам:</b>"])
+    authors = report.get("authors") or []
+    if authors:
+        for item in authors:
+            author = str(item.get("author") or "Без автора")
+            count = int(item.get("count") or 0)
+            lines.append(f"• {html_escape(author)} — <b>{count}</b>")
+    else:
+        lines.append("• нет данных")
+
+    return "\n".join(lines)[:4090]
+
+
+def send_monthly_stats_report(report: dict) -> dict:
+    if not MONTHLY_STATS_CHAT_ID:
+        raise RuntimeError("MONTHLY_STATS_CHAT_ID is empty")
+
+    payload = {
+        "chat_id": str(MONTHLY_STATS_CHAT_ID),
+        "text": build_monthly_stats_text(report),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if MONTHLY_STATS_THREAD_ID:
+        payload["message_thread_id"] = str(MONTHLY_STATS_THREAD_ID)
+
+    # Monthly reports are intentionally not added to the cleanup queue.
+    return telegram_api_json("sendMessage", payload)
+
+
+def run_monthly_stats_check_once():
+    if not MONTHLY_STATS_ENABLED:
+        return
+    if not MONTHLY_STATS_CHAT_ID:
+        print("MONTHLY STATS SKIP: no chat id", flush=True)
+        return
+
+    try:
+        result = sheets_get("get_monthly_stats", {"mode": "unsent"})
+        reports = result.get("reports") or []
+        print(
+            "MONTHLY STATS CHECK RESULT:",
+            {
+                "status": result.get("status"),
+                "script_version": result.get("script_version"),
+                "reports_count": len(reports),
+                "available_completed_months": result.get("available_completed_months"),
+            },
+            flush=True,
+        )
+
+        for report in reports:
+            month_key = str(report.get("key") or "").strip()
+            if not month_key:
+                continue
+            try:
+                sent = send_monthly_stats_report(report)
+                mark_result = sheets_post_action(
+                    "mark_monthly_stats_sent",
+                    {
+                        "month_key": month_key,
+                        "telegram_message_id": str(sent.get("message_id") or ""),
+                    },
+                )
+                print(
+                    "MONTHLY STATS SENT:",
+                    {
+                        "month_key": month_key,
+                        "total": report.get("total"),
+                        "message_id": sent.get("message_id"),
+                        "mark_result": mark_result,
+                    },
+                    flush=True,
+                )
+                time.sleep(0.25)
+            except Exception as e:
+                print("MONTHLY STATS SEND ERROR:", {"month_key": month_key, "error": str(e)}, flush=True)
+                break
+    except Exception as e:
+        print("MONTHLY STATS CHECK ERROR:", str(e), flush=True)
+
+
+
 def review_scheduler_loop():
     print("REVIEW SCHEDULER STARTED", {"interval_sec": REVIEW_CHECK_INTERVAL_SEC}, flush=True)
 
@@ -4239,14 +4325,15 @@ def review_scheduler_loop():
     while True:
         run_review_check_once()
         run_digest_check_once()
+        run_monthly_stats_check_once()
         time.sleep(REVIEW_CHECK_INTERVAL_SEC)
 
 
 def start_review_scheduler():
     global review_scheduler_started
 
-    if not REVIEW_ENGINE_ENABLED and not DIGEST_ENGINE_ENABLED:
-        print("REVIEW/DIGEST ENGINE DISABLED: set REVIEW_ENGINE_ENABLED=1 after Apps Script update", flush=True)
+    if not REVIEW_ENGINE_ENABLED and not DIGEST_ENGINE_ENABLED and not MONTHLY_STATS_ENABLED:
+        print("REVIEW/DIGEST/MONTHLY STATS ENGINES DISABLED", flush=True)
         return
 
     with review_scheduler_lock:
