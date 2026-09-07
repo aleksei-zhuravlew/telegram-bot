@@ -1,296 +1,1852 @@
-import os
-import re
-import json
-import time
-import mimetypes
-import tempfile
-import threading
-import hashlib
-import hmac
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl, unquote
+// V10: persistent draft pairing via Sheets row IDs
+// ======================
+// CONFIG
+// ======================
 
-import requests
-from PIL import Image, ImageOps
-from html import unescape
-from flask import Flask, request, Response
+var CONTENT_SHEET_NAME = "Таблица контента редакции";
+var PREDLOZHKA_SHEET_NAME = "Предложка";
+var MAPPING_SHEET_NAME = "Mapping";
+var SCHEDULE_SHEET_NAME = "Отложенные публикации";
+var CLEANUP_SHEET_NAME = "Очередь удаления";
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # Apps Script URL
-PORT = int(os.environ.get("PORT", "10000"))
+var FIRST_REMINDER_DAYS = 14;
+var REPEAT_REMINDER_DAYS = 5;
+var DEFAULT_DIGEST_SIZE = 5;
 
-VK_APP_ID = os.environ.get("VK_APP_ID", "")
-VK_APP_SECRET = os.environ.get("VK_APP_SECRET", "")
-VK_REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "")
-VK_AUTH_SECRET = os.environ.get("VK_AUTH_SECRET", "")
+// A review is considered published ONLY when its music link is found in the
+// exact Telegram channel assigned to that genre.
+var EXPECTED_CHANNEL_BY_GENRE = {
+  "glavred": "chto_music",
+  "rock": "chto_music_rock",
+  "indie": "chto_music_indie",
+  "folk": "chto_music_folk",
+  "pop": "chto_music_pop",
+  "hiphop": "chto_music_hiphop",
+  "electronica": "chto_music_electronica",
+  "underground": "chto_music_podval"
+};
 
-ALBUM_DELAY_SEC = float(os.environ.get("ALBUM_DELAY_SEC", "3"))
-APPEND_SOURCE_LINK = os.environ.get("APPEND_SOURCE_LINK", "1") == "1"
+var OPTIONAL_HEADERS_COMMON = [
+  "Type",
+  "Status",
+  "Yandex Link",
+  "Common Link",
+  "Genre",
+  "Thread ID",
+  "Chat ID",
+  "Cover File ID",
+  "Cover URL"
+];
 
-# ======================
-# EDITORIAL CMS SAFE CONFIG
-# ======================
-# Additive configuration. Existing channel_post -> Sheets -> VK flow remains unchanged.
-PREDLOZHKA_CAPTURE_ENABLED = os.environ.get("PREDLOZHKA_CAPTURE_ENABLED", "0") == "1"
-PREDLOZHKA_SHEET_NAME = os.environ.get("PREDLOZHKA_SHEET_NAME", "Предложка")
-PUBLISHED_SHEET_NAME = os.environ.get("PUBLISHED_SHEET_NAME", "Таблица контента редакции")
-
-# SAFETY FILTER:
-# Only messages from the real Predlozhka supergroup are written to the Predlozhka sheet.
-# This prevents the bot from capturing other editorial chats/statistics chats.
-PREDLOZHKA_ALLOWED_CHAT_IDS_RAW = os.environ.get(
-    "PREDLOZHKA_ALLOWED_CHAT_IDS",
-    "-1003533638771"
-)
-
-PREDLOZHKA_ALLOWED_CHAT_IDS = set()
-for _chat_id in PREDLOZHKA_ALLOWED_CHAT_IDS_RAW.split(","):
-    _chat_id = _chat_id.strip()
-    if _chat_id:
-        PREDLOZHKA_ALLOWED_CHAT_IDS.add(_chat_id)
-
-print("PREDLOZHKA_ALLOWED_CHAT_IDS:", sorted(PREDLOZHKA_ALLOWED_CHAT_IDS), flush=True)
-
-# Review engine is disabled by default for safe rollout.
-# Enable after Apps Script is updated: REVIEW_ENGINE_ENABLED=1
-REVIEW_ENGINE_ENABLED = os.environ.get("REVIEW_ENGINE_ENABLED", "0") == "1"
-REVIEW_CHECK_INTERVAL_SEC = int(os.environ.get("REVIEW_CHECK_INTERVAL_SEC", "3600"))
-
-# Digest engine uses the same scheduler. Enabled by default when REVIEW_ENGINE_ENABLED=1.
-DIGEST_ENGINE_ENABLED = os.environ.get(
-    "DIGEST_ENGINE_ENABLED",
-    "1" if REVIEW_ENGINE_ENABLED else "0"
-) == "1"
-DIGEST_SIZE = int(os.environ.get("DIGEST_SIZE", "5"))
-
-MONTHLY_STATS_ENABLED = os.environ.get("MONTHLY_STATS_ENABLED", "1") == "1"
-MONTHLY_STATS_CHAT_ID = os.environ.get("MONTHLY_STATS_CHAT_ID", "-1003533638771").strip()
-MONTHLY_STATS_THREAD_ID = os.environ.get("MONTHLY_STATS_THREAD_ID", "").strip()
+var OPTIONAL_HEADERS_PREDLOZHKA = [
+  "Type",
+  "Status",
+  "Last Reminder",
+  "Reminder Count",
+  "Found In",
+  "Yandex Link",
+  "Common Link",
+  "Genre",
+  "Thread ID",
+  "Chat ID",
+  "Cover File ID",
+  "Cover URL"
+];
 
 
-# ======================
-# AUTOPUBLISH PREVIEW — SAFE MVP
-# ======================
-# Disabled by default. Enable on Render only after adding the frame files to the repo.
-AUTOPUBLISH_PREVIEW_ENABLED = os.environ.get("AUTOPUBLISH_PREVIEW_ENABLED", "0") == "1"
-AUTOPUBLISH_TIMEZONE = os.environ.get("AUTOPUBLISH_TIMEZONE", "Europe/Moscow")
-AUTOPUBLISH_CHECK_INTERVAL_SEC = int(os.environ.get("AUTOPUBLISH_CHECK_INTERVAL_SEC", "20"))
-AUTOPUBLISH_STORE_PATH = os.environ.get("AUTOPUBLISH_STORE_PATH", "scheduled_posts.json")  # legacy fallback; Sheets is used for new schedules
-GENRE_FRAME_DIR = os.environ.get("GENRE_FRAME_DIR", "genre_frames")
+// ======================
+// GET
+// ======================
 
-# Remove the thin noisy/white fringe that can be baked into the inner edge
-# of transparent PNG frames. 3 px is intentionally conservative.
-FRAME_EDGE_CLEANUP_PX = max(
-    0,
-    int(os.environ.get("FRAME_EDGE_CLEANUP_PX", "3")),
-)
+function doGet(e) {
+  var action = (e && e.parameter && e.parameter.action) || "";
 
-# Telegram native copy_text is limited to 256 characters. Long editorial reviews
-# use a signed copy page hosted by this same Render web service.
-EDITORIAL_COPY_BASE_URL = (
-    os.environ.get("EDITORIAL_COPY_BASE_URL")
-    or os.environ.get("RENDER_EXTERNAL_URL")
-    or ""
-).rstrip("/")
-EDITORIAL_COPY_LINK_TTL_SEC = int(os.environ.get("EDITORIAL_COPY_LINK_TTL_SEC", str(2 * 24 * 60 * 60)))
+  if (action === "get_mapping") {
+    return getMapping();
+  }
 
-# Channel publishing is intentionally paused. The bot only prepares editorial drafts.
-AUTOPUBLISH_CHANNEL_ENABLED = os.environ.get("AUTOPUBLISH_CHANNEL_ENABLED", "0") == "1"
+  if (action === "check_reviews") {
+    return checkReviews();
+  }
 
-# Trusted external bot that sends reviews into Predlozhka topics.
-AUTOPUBLISH_TRUSTED_BOT_IDS_RAW = os.environ.get(
-    "AUTOPUBLISH_TRUSTED_BOT_IDS",
-    "7287549819",
-)
-AUTOPUBLISH_TRUSTED_BOT_IDS = set()
-for _bot_id in AUTOPUBLISH_TRUSTED_BOT_IDS_RAW.split(","):
-    _bot_id = _bot_id.strip()
-    if _bot_id:
-        AUTOPUBLISH_TRUSTED_BOT_IDS.add(_bot_id)
+  if (action === "get_review") {
+    return getReview(e);
+  }
 
-print(
-    "EDITORIAL DRAFT CONFIG:",
-    {
-        "preview_enabled": AUTOPUBLISH_PREVIEW_ENABLED,
-        "channel_publish_enabled": AUTOPUBLISH_CHANNEL_ENABLED,
-        "trusted_bot_ids": sorted(AUTOPUBLISH_TRUSTED_BOT_IDS),
-    },
-    flush=True,
-)
+  if (action === "get_ready_digests") {
+    return getReadyDigests(e);
+  }
 
-# V23: V22 + pending list sourced strictly from Predlozhka Title/Type/Status columns.
-# Keep the latest parts briefly so the editorial draft is assembled from both.
-EDITORIAL_DRAFT_PARTS_TTL_SEC = int(os.environ.get("EDITORIAL_DRAFT_PARTS_TTL_SEC", "1800"))
+  if (action === "get_pending_reviews") {
+    return getPendingReviews(e);
+  }
 
-# Bot service messages are removed shortly before Telegram's 48-hour deletion limit.
-BOT_MESSAGE_CLEANUP_ENABLED = os.environ.get("BOT_MESSAGE_CLEANUP_ENABLED", "1") == "1"
-BOT_MESSAGE_CLEANUP_AFTER_MINUTES = int(os.environ.get("BOT_MESSAGE_CLEANUP_AFTER_MINUTES", str(47 * 60 + 40)))
-BOT_MESSAGE_CLEANUP_CHECK_SEC = int(os.environ.get("BOT_MESSAGE_CLEANUP_CHECK_SEC", "300"))
+  if (action === "get_monthly_stats") {
+    return getMonthlyStats(e);
+  }
 
-TARGET_CHANNELS = {
-    "rock": "@chto_music_rock",
-    "indie": "@chto_music_indie",
-    "folk": "@chto_music_folk",
-    "pop": "@chto_music_pop",
-    "hiphop": "@chto_music_hiphop",
-    "electronica": "@chto_music_electronica",
-    "glavred": "@chto_music",
+  if (action === "get_due_cleanup_tasks") {
+    return getDueCleanupTasks(e);
+  }
+
+  if (action === "get_due_scheduled_posts") {
+    return getDueScheduledPosts(e);
+  }
+
+  return jsonResponse({ status: "ok" });
 }
 
-GENRE_FRAME_FILES = {
-    "rock": "rock_frame.png",
-    "indie": "indie_frame.png",
-    "folk": "folk_frame.png",
-    "pop": "pop_frame.png",
-    "hiphop": "hiphop_frame.png",
-    "glavred": "main_frame.png",
-    # electronica intentionally has no frame
+
+// ======================
+// POST
+// ======================
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+
+  try {
+    lock.waitLock(30000);
+
+    var raw = e.postData.contents;
+    var data = JSON.parse(raw);
+
+    if (data.action === "attach_cover_to_recent") {
+      return attachCoverToRecent(data);
+    }
+
+    if (data.action === "mark_review_done") {
+      return markReviewDone(data);
+    }
+
+    if (data.action === "mark_digest_done") {
+      return markDigestDone(data);
+    }
+
+    if (data.action === "mark_monthly_stats_sent") {
+      return markMonthlyStatsSent(data);
+    }
+
+    if (data.action === "add_cleanup_task") {
+      return addCleanupTask(data);
+    }
+
+    if (data.action === "mark_cleanup_done") {
+      return markCleanupDone(data);
+    }
+
+    if (data.action === "add_scheduled_post") {
+      return addScheduledPost(data);
+    }
+
+    if (data.action === "mark_scheduled_post_published") {
+      return markScheduledPostPublished(data);
+    }
+
+    if (data.action === "mark_scheduled_post_error") {
+      return markScheduledPostError(data);
+    }
+
+    return appendPost(data);
+
+  } catch (err) {
+    return jsonResponse({
+      error: String(err),
+      stack: err && err.stack ? String(err.stack) : ""
+    });
+
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {}
+  }
 }
 
-# Unique channel-disc custom emoji. They are used in editorial drafts before
-# “Artist — Track”. All have 💿 as a safe fallback glyph.
-GENRE_EMOJI_MAP = {
-    "glavred": {"emoji_id": "5332472742916678524", "visible": "💿"},
-    "rock": {"emoji_id": "5330416810791559528", "visible": "💿"},
-    "pop": {"emoji_id": "5332614176189732263", "visible": "💿"},
-    "folk": {"emoji_id": "5330462307380126280", "visible": "💿"},
-    "indie": {"emoji_id": "5330524983837875288", "visible": "💿"},
-    "hiphop": {"emoji_id": "5330100967486546882", "visible": "💿"},
-    "electronica": {"emoji_id": "5332493801141328118", "visible": "💿"},
+
+// ======================
+// MAPPING
+// ======================
+
+function getMapping() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(MAPPING_SHEET_NAME);
+
+  if (!sheet) {
+    return jsonResponse({ mapping: {}, error: "Mapping sheet not found" });
+  }
+
+  var data = sheet.getDataRange().getValues();
+  var result = {};
+
+  for (var i = 1; i < data.length; i++) {
+    var tgChannel = String(data[i][0] || "").trim();
+    var vkGroupId = String(data[i][1] || "").trim();
+    var vkToken = String(data[i][2] || "").trim();
+
+    if (!tgChannel || !vkGroupId || !vkToken) continue;
+
+    result[tgChannel] = {
+      group_id: vkGroupId,
+      token: vkToken
+    };
+  }
+
+  return jsonResponse({ mapping: result });
 }
 
-# Editorial section marker before the literal line “Что понравилось?”.
-LIKED_SECTION_EMOJI = {
-    "emoji_id": "5379970773358227593",
-    "visible": "✨",
+
+// ======================
+// APPEND POST
+// ======================
+
+function appendPost(data) {
+  var sheetName = resolveSheetName(data);
+
+  var sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName(sheetName);
+
+  if (!sheet) {
+    return jsonResponse({
+      error: "Sheet not found",
+      sheet: sheetName
+    });
+  }
+
+  if (sheetName === PREDLOZHKA_SHEET_NAME) {
+    ensureHeaders(sheet, OPTIONAL_HEADERS_PREDLOZHKA);
+  } else {
+    ensureHeaders(sheet, OPTIONAL_HEADERS_COMMON);
+  }
+
+  var dateData = formatDateAndMonth(data);
+  var formattedDate = dateData.formattedDate;
+  var month = dateData.month;
+
+  var duplicateInfo = findDuplicateInfo(sheet, data, formattedDate);
+
+  if (duplicateInfo) {
+    return jsonResponse({
+      status: duplicateInfo.status,
+      sheet: sheetName,
+      row: duplicateInfo.row
+    });
+  }
+
+  var typeValue = detectType(data, sheetName);
+  var statusValue = detectStatus(data, sheetName, typeValue);
+
+  var headerMap = getHeaderMap(sheet);
+  var lastColumn = sheet.getLastColumn();
+
+  var row = new Array(lastColumn).fill("");
+
+  // Старые колонки — не меняем
+  row[0] = data.title || "";
+  row[1] = data.channel || "";
+  row[2] = formattedDate;
+  row[3] = data.link || "";
+  row[4] = data.media_group_id || "";
+  row[5] = data.message_id || "";
+  row[6] = data.author || "";
+  row[7] = month;
+
+  // Новые колонки
+  setByHeader(row, headerMap, "Type", typeValue);
+  setByHeader(row, headerMap, "Status", statusValue);
+
+  setByHeader(row, headerMap, "Yandex Link", data.yandex_link || "");
+  setByHeader(row, headerMap, "Common Link", data.common_link || "");
+
+  setByHeader(row, headerMap, "Genre", data.genre || "");
+  setByHeader(row, headerMap, "Thread ID", data.thread_id || "");
+  setByHeader(row, headerMap, "Chat ID", data.chat_id || "");
+  setByHeader(row, headerMap, "Cover File ID", data.cover_file_id || "");
+  setByHeader(row, headerMap, "Cover URL", data.cover_url || "");
+
+  if (sheetName === PREDLOZHKA_SHEET_NAME) {
+    setByHeader(row, headerMap, "Last Reminder", data.last_reminder || "");
+    setByHeader(row, headerMap, "Reminder Count", data.reminder_count || "");
+    setByHeader(row, headerMap, "Found In", data.found_in || "");
+  }
+
+  sheet.appendRow(row);
+  var appendedRow = sheet.getLastRow();
+
+  return jsonResponse({
+    status: "ok",
+    sheet: sheetName,
+    type: typeValue,
+    row: appendedRow,
+    row_length: row.length
+  });
 }
 
-AUTHOR_EMOJI_MAP = {
-    # Алексей
-    "Алексей Журавлев": {
-        "emoji_id": "5429396071589642872",
-        "visible": "😎",
-    },
-    "Журавлев Алексей": {
-        "emoji_id": "5429396071589642872",
-        "visible": "😎",
-    },
 
-    # Редакция
-    "Нина Большакова": {
-        "emoji_id": "5219832642848986907",
-        "visible": "🙂",
-    },
-    "Ярослав Прохорычев": {
-        "emoji_id": "5321516513272834768",
-        "visible": "🙂",
-    },
-    "YuraKostin": {
-        "emoji_id": "5431444126744744292",
-        "visible": "🙂",
-    },
-    "Максим Ушаков": {
-        "emoji_id": "5190431817886374745",
-        "visible": "🙂",
-    },
-    "Вера Чистякова": {
-        "emoji_id": "5433845133722291311",
-        "visible": "🙂",
-    },
-    "Костя Шалтай": {
-        "emoji_id": "5303267416275456779",
-        "visible": "🙂",
-    },
-    "AndrrrRock": {
-        "emoji_id": "5429116615247561210",
-        "visible": "🙂",
-    },
-    "Павел Кофф": {
-        "emoji_id": "5431670364147057531",
-        "visible": "🙂",
-    },
+// ======================
+// ATTACH STANDALONE COVER
+// ======================
+
+function attachCoverToRecent(data) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PREDLOZHKA_SHEET_NAME);
+  if (!sheet) return jsonResponse({ error: "Sheet not found", sheet: PREDLOZHKA_SHEET_NAME });
+
+  ensureHeaders(sheet, OPTIONAL_HEADERS_PREDLOZHKA);
+  var map = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+  var chatId = String(data.chat_id || "").trim();
+  var threadId = String(data.thread_id || "").trim();
+  var coverFileId = String(data.cover_file_id || "").trim();
+  var coverUrl = String(data.cover_url || "").trim();
+  var preferredRow = Number(data.preferred_row || 0);
+  var replyMessageId = String(data.reply_to_message_id || "").trim();
+  var coverMessageId = Number(data.cover_message_id || 0);
+
+  if (!chatId || !threadId || (!coverFileId && !coverUrl)) {
+    return jsonResponse({ status: "skip", reason: "missing keys" });
+  }
+
+  function rowMatches(rowNumber) {
+    if (!rowNumber || rowNumber < 2 || rowNumber > values.length) return false;
+    var row = values[rowNumber - 1];
+    if (String(getValue(row, map, "Chat ID") || "").trim() !== chatId) return false;
+    if (String(getValue(row, map, "Thread ID") || "").trim() !== threadId) return false;
+    var title = String(row[0] || "").trim();
+    if (!title) return false;
+    var typeValue = String(getValue(row, map, "Type") || "").trim().toLowerCase();
+    return !typeValue || typeValue === "review" || typeValue === "digest";
+  }
+
+  function attach(rowNumber, matchType) {
+    if (coverFileId) setSheetValue(sheet, rowNumber, map, "Cover File ID", coverFileId);
+    if (coverUrl) setSheetValue(sheet, rowNumber, map, "Cover URL", coverUrl);
+    return jsonResponse({
+      status: "ok",
+      row: rowNumber,
+      match: matchType,
+      cover_message_id: String(data.cover_message_id || "")
+    });
+  }
+
+  // 1) Python just received the review text and knows its exact sheet row.
+  if (rowMatches(preferredRow)) return attach(preferredRow, "preferred_row");
+
+  // 2) Telegram reply relation gives an exact source message ID.
+  if (replyMessageId) {
+    for (var r = values.length; r >= 2; r--) {
+      if (!rowMatches(r)) continue;
+      var rowReply = values[r - 1];
+      if (String(getValue(rowReply, map, "message_id") || "").trim() === replyMessageId) {
+        return attach(r, "reply_message_id");
+      }
+    }
+  }
+
+  // 3) Fallback: nearest preceding review message in this exact topic.
+  // Never jump to a random old row; cap the gap at 50 Telegram message IDs.
+  var bestRow = 0;
+  var bestGap = 999999999;
+  if (coverMessageId) {
+    for (var i = values.length; i >= 2; i--) {
+      if (!rowMatches(i)) continue;
+      var row = values[i - 1];
+      var sourceMessageId = Number(getValue(row, map, "message_id") || 0);
+      if (!sourceMessageId || sourceMessageId >= coverMessageId) continue;
+      var gap = coverMessageId - sourceMessageId;
+      if (gap > 50) continue;
+      if (gap < bestGap) {
+        bestGap = gap;
+        bestRow = i;
+      }
+    }
+  }
+  if (bestRow) return attach(bestRow, "nearest_message_id");
+
+  return jsonResponse({ status: "not_found", chat_id: chatId, thread_id: threadId });
 }
 
-# Custom emoji pack used by the editorial team.
-# Telegram link: https://t.me/addemoji/ChtoMusicTeam
-CUSTOM_EMOJI_PACK_NAME = os.environ.get("CUSTOM_EMOJI_PACK_NAME", "ChtoMusicTeam").strip() or "ChtoMusicTeam"
+// ======================
+// REVIEW ENGINE
+// ======================
 
-# In-memory state for the short dialogue after pressing “Опубликовать позже”.
-# Scheduled jobs themselves are also saved to AUTOPUBLISH_STORE_PATH.
-awaiting_schedule = {}
-scheduled_posts_lock = threading.Lock()
-autopublish_scheduler_started = False
-autopublish_scheduler_lock = threading.Lock()
-preview_dedup = {}
-editorial_draft_parts = {}
-editorial_draft_parts_lock = threading.Lock()
-cleanup_scheduler_started = False
-cleanup_scheduler_lock = threading.Lock()
+function checkReviews() {
+  var lock = LockService.getScriptLock();
 
-# ======================
-# PREDLOZHKA THREAD MAP
-# ======================
-# Default production map collected from Render logs.
-# Can still be overridden/extended from Render env THREAD_MAP_JSON if needed.
-DEFAULT_THREAD_MAP = {
-    645: "rock",
-    641: "indie",
-    649: "electronica",
-    647: "folk",
-    643: "pop",
-    653: "underground",
-    651: "hiphop",
-    3355: "glavred",
+  try {
+    lock.waitLock(30000);
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var predSheet = ss.getSheetByName(PREDLOZHKA_SHEET_NAME);
+    var pubSheet = ss.getSheetByName(CONTENT_SHEET_NAME);
+
+    if (!predSheet || !pubSheet) {
+      return jsonResponse({
+        error: "Required sheet not found",
+        predlozhka_found: !!predSheet,
+        publications_found: !!pubSheet
+      });
+    }
+
+    ensureHeaders(predSheet, OPTIONAL_HEADERS_PREDLOZHKA);
+    ensureHeaders(pubSheet, OPTIONAL_HEADERS_COMMON);
+
+    var predMap = getHeaderMap(predSheet);
+    var pubMap = getHeaderMap(pubSheet);
+
+    var predValues = predSheet.getDataRange().getValues();
+    var pubValues = pubSheet.getDataRange().getValues();
+
+    var publicationIndex = buildPublicationLinkIndex(pubValues, pubMap, pubSheet);
+
+    var now = new Date();
+    var reminders = [];
+    var doneCount = 0;
+    var newlyDoneCount = 0;
+    var repairedDoneCount = 0;
+    var matchedYandexCount = 0;
+    var matchedCommonCount = 0;
+    var matchedCrossGenreCount = 0;
+    var matchedAmbiguousCount = 0;
+    var reviewYandexSeen = 0;
+    var reviewCommonSeen = 0;
+    var contentYandexIndexed = 0;
+    var contentCommonIndexed = 0;
+    var reminderCount = 0;
+    var checkedCount = 0;
+
+    for (var i = 1; i < predValues.length; i++) {
+      var row = predValues[i];
+      var rowNumber = i + 1;
+
+      var typeValue = String(getValue(row, predMap, "Type") || "").toLowerCase().trim();
+      var statusValue = String(getValue(row, predMap, "Status") || "").toLowerCase().trim();
+
+      if (typeValue !== "review") continue;
+
+      // Legacy safety: old rows may have been saved as Type=review even though
+      // their text is #сверхновые. They belong to the digest engine, not reviews.
+      if (rowLooksLikeSupersnovye(row, predMap)) continue;
+
+      if (["cancelled", "canceled"].indexOf(statusValue) !== -1) continue;
+
+      var reviewGenre = String(
+        getValue(row, predMap, "Genre") ||
+        getValue(row, predMap, "Channel") ||
+        ""
+      ).trim().toLowerCase();
+
+      var reviewTypedLinks = getTypedReleaseLinks(row, predMap, "predlozhka");
+
+      for (var seenIndex = 0; seenIndex < reviewTypedLinks.length; seenIndex++) {
+        if (reviewTypedLinks[seenIndex].kind === "yandex") reviewYandexSeen++;
+        if (reviewTypedLinks[seenIndex].kind === "common") reviewCommonSeen++;
+      }
+
+      var reviewLinks = reviewTypedLinks.map(function(item) { return item.url; });
+      var reviewDateValue = getValue(row, predMap, "Date") || (row.length > 2 ? row[2] : "");
+      var reviewRawText = String(
+        getValue(row, predMap, "Title") ||
+        (row.length ? row[0] : "") ||
+        ""
+      ).trim();
+      var reviewDisplayTitle = buildPendingDisplayTitle(reviewRawText);
+
+      var found = reviewTypedLinks.length
+        ? findPublication(
+            reviewTypedLinks,
+            publicationIndex,
+            reviewGenre,
+            reviewDateValue,
+            reviewDisplayTitle
+          )
+        : null;
+
+      // Manual confirmation means an editor explicitly confirmed that the review
+      // is already on the channel. Keep it final.
+      var foundInValue = String(getValue(row, predMap, "Found In") || "").trim();
+      var isManualDone = statusValue === "done" && foundInValue.indexOf("manual:") === 0;
+
+      // V44 safety rule:
+      // existing done rows are FINAL here. checkReviews may promote pending -> done,
+      // but it must never demote done -> pending automatically.
+      //
+      // This is what prevents a future matcher tweak from suddenly adding dozens
+      // of already-published reviews back into "Невышедшие посты".
+      if (statusValue === "done") {
+        continue;
+      }
+
+      if (isManualDone) continue;
+
+      checkedCount++;
+
+      if (found) {
+        if (
+          found.match_method === "yandex_exact" ||
+          found.match_method === "yandex_exact_cross_genre"
+        ) {
+          matchedYandexCount++;
+        }
+
+        if (
+          found.match_method === "common_exact" ||
+          found.match_method === "common_exact_cross_genre"
+        ) {
+          matchedCommonCount++;
+        }
+
+        if (found.cross_genre) matchedCrossGenreCount++;
+        if (found.ambiguous_publication) matchedAmbiguousCount++;
+
+        if (statusValue !== "done" || foundInValue !== (found.post_link || found.matched_link || "")) {
+          setSheetValue(predSheet, rowNumber, predMap, "Status", "done");
+          setSheetValue(predSheet, rowNumber, predMap, "Found In", found.post_link || found.matched_link || "");
+          newlyDoneCount++;
+        }
+
+        doneCount++;
+        continue;
+      }
+
+      if (statusValue !== "pending") {
+        continue;
+      }
+
+      var createdAt = parseSheetDate(getValue(row, predMap, "Date"));
+      var daysOld = createdAt ? Math.floor((now.getTime() - createdAt.getTime()) / (24 * 60 * 60 * 1000)) : null;
+
+      if (daysOld === null || daysOld < FIRST_REMINDER_DAYS) {
+        continue;
+      }
+
+      var lastReminderRaw = getValue(row, predMap, "Last Reminder");
+      var lastReminder = parseSheetDate(lastReminderRaw);
+
+      // One individual reminder only. After that editors use the
+      // “Невышедшие посты” button/list instead of repeated personal reminders.
+      if (lastReminder) {
+        continue;
+      }
+
+      var existingReminderCount = Number(getValue(row, predMap, "Reminder Count") || 0);
+      var newReminderCount = existingReminderCount + 1;
+
+      setSheetValue(predSheet, rowNumber, predMap, "Last Reminder", formatDate(now));
+      setSheetValue(predSheet, rowNumber, predMap, "Reminder Count", newReminderCount);
+
+      reminders.push({
+        row: rowNumber,
+        title: getValue(row, predMap, "Title") || "",
+        channel: getValue(row, predMap, "Channel") || "",
+        link: getValue(row, predMap, "Link") || "",
+        message_id: getValue(row, predMap, "message_id") || "",
+        genre: getValue(row, predMap, "Genre") || getValue(row, predMap, "Channel") || "",
+        chat_id: getValue(row, predMap, "Chat ID") || "",
+        thread_id: getValue(row, predMap, "Thread ID") || "",
+        yandex_link: getValue(row, predMap, "Yandex Link") || "",
+        common_link: getValue(row, predMap, "Common Link") || "",
+        days_old: daysOld,
+        reminder_count: newReminderCount
+      });
+
+      reminderCount++;
+    }
+
+    return jsonResponse({
+      status: "ok",
+      script_version: "V49",
+      checked: checkedCount,
+      found_published: doneCount,
+      marked_done: newlyDoneCount,
+      repaired_done: repairedDoneCount,
+      matched_yandex: matchedYandexCount,
+      matched_common: matchedCommonCount,
+      matched_cross_genre: matchedCrossGenreCount,
+      matched_ambiguous: matchedAmbiguousCount,
+      url_normalizer: "string_parser_no_URL_WebAPI",
+      review_yandex_seen: reviewYandexSeen,
+      review_common_seen: reviewCommonSeen,
+      content_yandex_indexed: (publicationIndex.__meta || {}).yandex_indexed || 0,
+      content_common_indexed: (publicationIndex.__meta || {}).common_indexed || 0,
+      repaired_telegram_links: (publicationIndex.__meta || {}).repaired_telegram_links || 0,
+      missing_telegram_links: (publicationIndex.__meta || {}).missing_telegram_links || 0,
+      reminders_count: reminderCount,
+      reminders: reminders
+    });
+
+  } catch (err) {
+    return jsonResponse({
+      error: String(err),
+      stack: err && err.stack ? String(err.stack) : ""
+    });
+
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (e) {}
+  }
 }
 
-# Optional override/extension in Render env, format:
-# {"645":"rock","641":"indie","649":"electronica"}
-THREAD_MAP_JSON = os.environ.get("THREAD_MAP_JSON", "")
 
-THREAD_MAP = DEFAULT_THREAD_MAP.copy()
+function markReviewDone(data) {
+  var sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName(PREDLOZHKA_SHEET_NAME);
 
-if THREAD_MAP_JSON:
-    try:
-        THREAD_MAP.update({int(k): str(v) for k, v in json.loads(THREAD_MAP_JSON).items()})
-    except Exception as e:
-        print("THREAD_MAP_JSON ERROR:", str(e), flush=True)
+  if (!sheet) {
+    return jsonResponse({ error: "Predlozhka sheet not found" });
+  }
 
-print("THREAD_MAP LOADED:", THREAD_MAP, flush=True)
+  ensureHeaders(sheet, OPTIONAL_HEADERS_PREDLOZHKA);
 
-COMMON_LINK_DOMAINS = (
-    "band.link",
-    "bnd.lc",
-    "bfan.link",
-    "bff.link",
-    "lnk.to",
-    "linkfire",
-    "ffm.to",
-    "song.link",
-    "songwhip",
-    "onerpm.link",
-    "hyperfollow",
-    "taplink",
-    "mssg.me",
-    "clck.ru",
-    "vk.cc",
-    "zvonko.link",
-)
+  var rowNumber = Number(data.row || 0);
 
+  if (!rowNumber || rowNumber < 2) {
+    return jsonResponse({ error: "Bad row number", row: data.row });
+  }
 
-CHANNEL_CURATORS = {
-    "chto_music": "Павел Кофф",
-    "chto_music_podval": "Цур",
-    "chto_music_folk": "Анастасия Викто",
-    "chto_music_pop": "Daniel",
-    "chto_music_hiphop": "Цур",
-    "chto_music_rock": "Андрей Копанев",
-    "chto_music_electronica": "Баканов Дмитрий",
-    "chto_music_indie": "Вера Чистякова",
+  var headerMap = getHeaderMap(sheet);
+
+  setSheetValue(sheet, rowNumber, headerMap, "Status", "done");
+  setSheetValue(sheet, rowNumber, headerMap, "Found In", data.found_in || "manual");
+
+  return jsonResponse({
+    status: "ok",
+    row: rowNumber,
+    found_in: data.found_in || "manual"
+  });
 }
 
-MONTH_NAMES_RU = [
+
+function getReview(e) {
+  var rowNumber = Number((e && e.parameter && e.parameter.row) || 0);
+
+  if (!rowNumber || rowNumber < 2) {
+    return jsonResponse({ error: "Bad row number", row: rowNumber });
+  }
+
+  var sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName(PREDLOZHKA_SHEET_NAME);
+
+  if (!sheet) {
+    return jsonResponse({ error: "Predlozhka sheet not found" });
+  }
+
+  var headerMap = getHeaderMap(sheet);
+  var values = sheet.getRange(rowNumber, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  return jsonResponse({
+    status: "ok",
+    row: rowNumber,
+    title: getValue(values, headerMap, "Title") || "",
+    channel: getValue(values, headerMap, "Channel") || "",
+    date: String(getValue(values, headerMap, "Date") || ""),
+    link: getValue(values, headerMap, "Link") || "",
+    message_id: getValue(values, headerMap, "message_id") || "",
+    genre: getValue(values, headerMap, "Genre") || "",
+    thread_id: getValue(values, headerMap, "Thread ID") || "",
+    chat_id: getValue(values, headerMap, "Chat ID") || "",
+    yandex_link: getValue(values, headerMap, "Yandex Link") || "",
+    common_link: getValue(values, headerMap, "Common Link") || "",
+    cover_file_id: getValue(values, headerMap, "Cover File ID") || "",
+    cover_url: getValue(values, headerMap, "Cover URL") || ""
+  });
+}
+
+
+function rowLooksLikeSupersnovye(row, headerMap) {
+  var raw = String(
+    getValue(row, headerMap, "Title") ||
+    (row && row.length ? row[0] : "") ||
+    ""
+  ).toLowerCase();
+
+  return raw.indexOf("#сверхновые") !== -1;
+}
+
+
+// ======================
+// PENDING REVIEWS — button/menu list
+// ======================
+function pluralRu(n, one, few, many) {
+  n = Math.abs(Number(n) || 0);
+  var mod10 = n % 10;
+  var mod100 = n % 100;
+
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few;
+  return many;
+}
+
+
+function buildPendingAgeDisplay(dateValue, now) {
+  var createdAt = parseSheetDate(dateValue);
+  if (!createdAt) return "";
+
+  now = now || new Date();
+  var diffMs = now.getTime() - createdAt.getTime();
+  if (diffMs < 0) diffMs = 0;
+
+  var minutes = Math.floor(diffMs / (60 * 1000));
+  if (minutes < 5) return "только что";
+  if (minutes < 60) return minutes + " мин";
+
+  var hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return hours + " " + pluralRu(hours, "час", "часа", "часов");
+  }
+
+  var days = Math.floor(hours / 24);
+  var restHours = hours % 24;
+
+  if (days < 30) {
+    var dayPart = days + " " + pluralRu(days, "день", "дня", "дней");
+    return restHours ? dayPart + " " + restHours + " ч" : dayPart;
+  }
+
+  var months = Math.floor(days / 30);
+  var restDays = days % 30;
+  var monthPart = months + " " + pluralRu(months, "месяц", "месяца", "месяцев");
+  return restDays ? monthPart + " " + restDays + " д" : monthPart;
+}
+
+
+function getPendingRawReviewText(row, headerMap) {
+  // In the real "Предложка" sheet the full review text is column A.
+  // Use it as the primary source because it is what the editor sees in the sheet.
+  var firstColumn = String((row && row.length ? row[0] : "") || "").trim();
+  if (firstColumn) return firstColumn;
+
+  return String(getValue(row, headerMap, "Title") || "").trim();
+}
+
+
+function cleanPendingTitleLine(line) {
+  return String(line || "")
+    .replace(/^\s*[💿•·▪▫◦]+\s*/u, "")
+    .replace(/^[*_~`]+|[*_~`]+$/g, "")
+    .trim();
+}
+
+
+function isPendingServiceLine(line) {
+  var value = cleanPendingTitleLine(line);
+  var low = value.toLowerCase();
+
+  if (!value) return true;
+  if (/^@/.test(value)) return true;
+  if (/^#/.test(value)) return true;
+  if (/^автор\s*[:\-–—]/i.test(value)) return true;
+  if (low.indexOf("удалить перед публикацией") !== -1) return true;
+  if (low.indexOf("скачать облож") !== -1) return true;
+  if (/^(вконтакте|telegram|яндекс музыка|слушать везде)\b/i.test(value)) return true;
+
+  return false;
+}
+
+
+function looksLikeReleaseTitleForPending(line) {
+  line = cleanPendingTitleLine(line);
+  if (!line || line.length > 220) return false;
+
+  // Artist - Track / Artist – Track / Artist — Track.
+  // Require visible text on both sides of the separator.
+  var match = line.match(/^(.{1,100}?)\s*([—–-])\s*(.{1,120})$/u);
+  if (!match) return false;
+
+  var left = String(match[1] || "").trim();
+  var right = String(match[3] || "").trim();
+  if (!left || !right) return false;
+
+  // Avoid obvious prose/list fragments.
+  if (/[.!?]$/.test(left)) return false;
+  if (/^(что понравилось|автор)\b/i.test(left)) return false;
+
+  return true;
+}
+
+
+function buildPendingDisplayTitle(rawText) {
+  rawText = String(rawText || "");
+  if (!rawText) return "Публикация";
+
+  var allLines = rawText
+    .split(/\r?\n/)
+    .map(cleanPendingTitleLine)
+    .filter(function(line) { return !isPendingServiceLine(line); });
+
+  // The release title is normally one of the first lines, immediately after
+  // the teaser/quote. Search the first six meaningful lines first.
+  for (var i = 0; i < Math.min(allLines.length, 6); i++) {
+    if (looksLikeReleaseTitleForPending(allLines[i])) {
+      return allLines[i].substring(0, 180);
+    }
+  }
+
+  // Compatibility with older review layouts.
+  for (var j = 6; j < allLines.length; j++) {
+    if (looksLikeReleaseTitleForPending(allLines[j])) {
+      return allLines[j].substring(0, 180);
+    }
+  }
+
+  // Never make every item look identical if an old row has an unusual layout.
+  // Use the first meaningful line as a last-resort label.
+  return allLines.length ? allLines[0].substring(0, 180) : "Публикация";
+}
+
+
+function normalizeHeaderForPending(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_\-]+/g, "");
+}
+
+
+function getPendingStatusColumnInfo(sheet) {
+  var lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return [];
+
+  var headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  var aliases = {
+    "status": true,
+    "статус": true
+  };
+  var result = [];
+
+  for (var i = 0; i < headers.length; i++) {
+    var normalized = normalizeHeaderForPending(headers[i]);
+    if (aliases[normalized]) {
+      result.push({
+        index: i,
+        column: i + 1,
+        header: String(headers[i] || "")
+      });
+    }
+  }
+
+  return result;
+}
+
+
+function normalizePendingStatus(value) {
+  return String(value || "")
+    .replace(/\u00A0/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+
+function isTerminalPendingStatus(value) {
+  var status = normalizePendingStatus(value);
+  if (!status) return false;
+
+  return /^(done|published|cancelled|canceled)(?:\b|$)/i.test(status) ||
+         /^(готово|опубликовано|отменено)(?:\b|$)/i.test(status);
+}
+
+
+function rowHasTerminalPendingStatus(row, statusColumns, fallbackStatus) {
+  for (var i = 0; i < statusColumns.length; i++) {
+    var idx = statusColumns[i].index;
+    if (idx >= 0 && idx < row.length && isTerminalPendingStatus(row[idx])) {
+      return true;
+    }
+  }
+
+  return isTerminalPendingStatus(fallbackStatus);
+}
+
+
+function buildPublishedPendingLinkIndex(values, headerMap) {
+  var byLink = {};
+
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+
+    // On the content sheet J is the final Status column.
+    var rawStatus = row.length > 9 ? row[9] : "";
+    var statusValue = String(rawStatus || getValue(row, headerMap, "Status") || "")
+      .replace(/\u00A0/g, " ")
+      .trim()
+      .toLowerCase();
+
+    // Only actually published/final content rows are valid proof of publication.
+    if (
+      !/^(done|published)(?:\b|$)/i.test(statusValue) &&
+      !/^(готово|опубликовано)(?:\b|$)/i.test(statusValue)
+    ) {
+      continue;
+    }
+
+    var channel = normalizeTelegramChannelName(
+      getValue(row, headerMap, "Channel") || (row.length > 1 ? row[1] : "") || ""
+    );
+    if (!channel) continue;
+
+    // Publication identity is ONLY the release links:
+    // Yandex Link OR Common Link / multilink.
+    var links = getReviewLinks(row, headerMap);
+
+    for (var j = 0; j < links.length; j++) {
+      var key = channel + "|" + links[j];
+      byLink[key] = {
+        row: i + 1,
+        post_link: getValue(row, headerMap, "Link") || "",
+        matched_link: links[j]
+      };
+    }
+  }
+
+  return byLink;
+}
+
+
+function findPublishedPendingByReleaseLink(reviewLinks, genre, publishedLinkIndex) {
+  var expectedChannel = expectedChannelForGenre(genre);
+  if (!expectedChannel) return null;
+
+  for (var i = 0; i < reviewLinks.length; i++) {
+    var match = publishedLinkIndex[expectedChannel + "|" + reviewLinks[i]];
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}
+
+
+function getPendingReviews(e) {
+  var requestedGenre = String((e && e.parameter && e.parameter.genre) || "").trim().toLowerCase();
+  var limit = Number((e && e.parameter && e.parameter.limit) || 200);
+  if (!limit || limit < 1) limit = 200;
+  if (limit > 500) limit = 500;
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var predSheet = ss.getSheetByName(PREDLOZHKA_SHEET_NAME);
+
+  if (!predSheet) {
+    return jsonResponse({
+      status: "error",
+      script_version: "V49",
+      error: "Predlozhka sheet not found",
+      items: []
+    });
+  }
+
+  ensureHeaders(predSheet, OPTIONAL_HEADERS_PREDLOZHKA);
+
+  var predMap = getHeaderMap(predSheet);
+  var predValues = predSheet.getDataRange().getValues();
+  var now = new Date();
+
+  var items = [];
+  var skippedTerminal = 0;
+  var skippedNoise = 0;
+  var skippedDuplicate = 0;
+  var seenRows = {};
+
+  for (var i = 1; i < predValues.length; i++) {
+    var row = predValues[i];
+    var rowNumber = i + 1;
+
+    // Production "Предложка":
+    // A = full review text
+    // G = author
+    // I = Type
+    // J = Status
+    //
+    // IMPORTANT: publication detection belongs to checkReviews().
+    // /pending ONLY reads the current Status and never performs its own
+    // publication check against the content sheet.
+    var rawType = row.length > 8 ? row[8] : "";
+    var rawStatus = row.length > 9 ? row[9] : "";
+
+    var typeValue = String(rawType || getValue(row, predMap, "Type") || "")
+      .replace(/\u00A0/g, " ")
+      .trim()
+      .toLowerCase();
+
+    var statusValue = String(rawStatus || getValue(row, predMap, "Status") || "")
+      .replace(/\u00A0/g, " ")
+      .trim()
+      .toLowerCase();
+
+    if (typeValue !== "review") continue;
+
+    // "Невышедшие посты" is ONLY for reviews.
+    // Never show #сверхновые here, even if a historical row has wrong Type=review.
+    if (rowLooksLikeSupersnovye(row, predMap)) continue;
+
+    // Status in column J is authoritative for the pending digest.
+    if (
+      /^(done|published|cancelled|canceled)(?:\b|$)/i.test(statusValue) ||
+      /^(готово|опубликовано|отменено)(?:\b|$)/i.test(statusValue)
+    ) {
+      skippedTerminal++;
+      continue;
+    }
+
+    var genre = String(
+      getValue(row, predMap, "Genre") ||
+      getValue(row, predMap, "Channel") ||
+      (row.length > 15 ? row[15] : "") ||
+      ""
+    ).trim();
+
+    if (
+      requestedGenre &&
+      requestedGenre !== "all" &&
+      genre.toLowerCase() !== requestedGenre
+    ) {
+      continue;
+    }
+
+    var pendingRawText = getPendingRawReviewText(row, predMap);
+    var displayTitle = buildPendingDisplayTitle(pendingRawText);
+    var reviewLinks = getReviewLinks(row, predMap);
+
+    var authorValue = String(
+      getValue(row, predMap, "author") ||
+      getValue(row, predMap, "Author") ||
+      (row.length > 6 ? row[6] : "") ||
+      ""
+    ).trim();
+
+    // V22 already prevents new human chatter from entering Predlozhka.
+    // For old polluted rows, require at least one sign of a real review:
+    // extracted author OR Yandex/Common release link.
+    // Do NOT require title parsing: a valid pending review must not disappear
+    // only because its Artist - Track line has an unusual format.
+    if (!authorValue && reviewLinks.length === 0) {
+      skippedNoise++;
+      continue;
+    }
+
+    // Avoid literal duplicate sheet rows with the same source message id.
+    var sourceMessageId = String(
+      getValue(row, predMap, "message_id") ||
+      getValue(row, predMap, "Message ID") ||
+      (row.length > 5 ? row[5] : "") ||
+      rowNumber
+    ).trim();
+
+    var dedupeKey = String(genre || "").toLowerCase() + "|" + sourceMessageId;
+    if (seenRows[dedupeKey]) {
+      skippedDuplicate++;
+      continue;
+    }
+    seenRows[dedupeKey] = true;
+
+    items.push({
+      row: rowNumber,
+      title: pendingRawText,
+      display_title: displayTitle,
+      channel: getValue(row, predMap, "Channel") || "",
+      genre: genre,
+      status: statusValue,
+      link: getValue(row, predMap, "Link") || "",
+      yandex_link: getValue(row, predMap, "Yandex Link") || "",
+      common_link: getValue(row, predMap, "Common Link") || "",
+      date: String(getValue(row, predMap, "Date") || ""),
+      age_display: buildPendingAgeDisplay(getValue(row, predMap, "Date"), now)
+    });
+
+    if (items.length >= limit) break;
+  }
+
+  return jsonResponse({
+    status: "ok",
+    script_version: "V49",
+    source_of_truth: "V47 matching; Apps Script-safe string URL normalization; no URL Web API",
+    count: items.length,
+    skipped_terminal: skippedTerminal,
+    skipped_noise: skippedNoise,
+    skipped_duplicate: skippedDuplicate,
+    items: items
+  });
+}
+
+
+// ======================
+// DIGEST ENGINE
+// ======================
+
+function getReadyDigests(e) {
+  var size = Number((e && e.parameter && e.parameter.size) || DEFAULT_DIGEST_SIZE || 5);
+
+  if (!size || size < 1) {
+    size = 5;
+  }
+
+  // ROCK ONLY: 9 #сверхновые per digest.
+  // Every other genre keeps the existing configured size (normally 5).
+  var rockDigestSize = 9;
+
+  function isRockDigestGroup(group) {
+    var genreValue = String((group && group.genre) || "")
+      .toLowerCase()
+      .trim()
+      .replace(/ё/g, "е");
+
+    return (
+      genreValue === "rock" ||
+      genreValue === "рок" ||
+      genreValue === "chto_music_rock" ||
+      genreValue === "@chto_music_rock" ||
+      String((group && group.thread_id) || "").trim() === "645"
+    );
+  }
+
+  var sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName(PREDLOZHKA_SHEET_NAME);
+
+  if (!sheet) {
+    return jsonResponse({ error: "Predlozhka sheet not found" });
+  }
+
+  ensureHeaders(sheet, OPTIONAL_HEADERS_PREDLOZHKA);
+
+  var headerMap = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+
+  var groups = {};
+
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    var rowNumber = i + 1;
+
+    var typeValue = String(getValue(row, headerMap, "Type") || "").toLowerCase().trim();
+    var statusValue = String(getValue(row, headerMap, "Status") || "").toLowerCase().trim();
+
+    // Only rows explicitly classified as digest may be sent.
+    // We intentionally do NOT auto-promote old Type=review rows here:
+    // they may be historical items whose digest was already sent, and blindly
+    // re-queuing them could create duplicate digests.
+    if (typeValue !== "digest") continue;
+    if (statusValue !== "pending") continue;
+
+    var chatId = String(getValue(row, headerMap, "Chat ID") || "").trim();
+    var threadId = String(getValue(row, headerMap, "Thread ID") || "").trim();
+    var genre = String(getValue(row, headerMap, "Genre") || getValue(row, headerMap, "Channel") || "").trim();
+
+    if (!chatId || !threadId) continue;
+
+    var key = chatId + ":" + threadId + ":" + genre;
+
+    if (!groups[key]) {
+      groups[key] = {
+        chat_id: chatId,
+        thread_id: threadId,
+        genre: genre,
+        rows: [],
+        items: []
+      };
+    }
+
+    groups[key].rows.push(rowNumber);
+    groups[key].items.push({
+      row: rowNumber,
+      title: getValue(row, headerMap, "Title") || "",
+      link: getValue(row, headerMap, "Link") || "",
+      message_id: getValue(row, headerMap, "message_id") || "",
+      yandex_link: getValue(row, headerMap, "Yandex Link") || "",
+      common_link: getValue(row, headerMap, "Common Link") || "",
+      cover_file_id: getValue(row, headerMap, "Cover File ID") || "",
+      cover_url: getValue(row, headerMap, "Cover URL") || ""
+    });
+  }
+
+  var digests = [];
+
+  for (var key in groups) {
+    if (!groups.hasOwnProperty(key)) continue;
+
+    var group = groups[key];
+    var targetSize = isRockDigestGroup(group) ? rockDigestSize : size;
+
+    if (group.rows.length >= targetSize) {
+      var candidateItems = group.items.slice(0, targetSize);
+
+      // IMPORTANT:
+      // The Python digest builder already knows how to build the common collage
+      // when an individual cover is missing: it substitutes a placeholder tile.
+      //
+      // Older code silently blocked the ENTIRE digest until all five rows had
+      // Cover File ID / Cover URL. That made a complete 5-item #сверхновые
+      // batch disappear with digests_count=0 when even one cover was missing.
+      //
+      // Required pending rows are enough to emit the digest: 9 for Rock, existing size for every other genre.
+      var missingCoverRows = [];
+      for (var m = 0; m < candidateItems.length; m++) {
+        var digestItem = candidateItems[m];
+        var hasCover =
+          String(digestItem.cover_file_id || "").trim() ||
+          String(digestItem.cover_url || "").trim();
+
+        if (!hasCover) {
+          missingCoverRows.push(digestItem.row);
+        }
+      }
+
+      digests.push({
+        chat_id: group.chat_id,
+        thread_id: group.thread_id,
+        genre: group.genre,
+        rows: group.rows.slice(0, targetSize),
+        items: candidateItems,
+        count: targetSize,
+        target_size: targetSize,
+        missing_cover_rows: missingCoverRows
+      });
+    }
+  }
+
+  var groupsDebug = [];
+  for (var debugKey in groups) {
+    if (!groups.hasOwnProperty(debugKey)) continue;
+
+    var debugGroup = groups[debugKey];
+    var pendingCount = debugGroup.rows.length;
+    var coverCount = 0;
+
+    for (var d = 0; d < debugGroup.items.length; d++) {
+      var debugItem = debugGroup.items[d];
+      if (
+        String(debugItem.cover_file_id || "").trim() ||
+        String(debugItem.cover_url || "").trim()
+      ) {
+        coverCount++;
+      }
+    }
+
+    groupsDebug.push({
+      genre: debugGroup.genre,
+      chat_id: debugGroup.chat_id,
+      thread_id: debugGroup.thread_id,
+      pending_digest_rows: pendingCount,
+      covers_ready: coverCount,
+      target_size: isRockDigestGroup(debugGroup) ? rockDigestSize : size,
+      rows: debugGroup.rows.slice(0, 12)
+    });
+  }
+
+  return jsonResponse({
+    status: "ok",
+    script_version: "V50_ROCK_9",
+    size: size,
+    digests_count: digests.length,
+    groups_debug: groupsDebug,
+    digests: digests
+  });
+}
+
+
+function markDigestDone(data) {
+  var sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName(PREDLOZHKA_SHEET_NAME);
+
+  if (!sheet) {
+    return jsonResponse({ error: "Predlozhka sheet not found" });
+  }
+
+  ensureHeaders(sheet, OPTIONAL_HEADERS_PREDLOZHKA);
+
+  var headerMap = getHeaderMap(sheet);
+  var rowsRaw = String(data.rows || "").trim();
+
+  if (!rowsRaw) {
+    return jsonResponse({ error: "No rows provided" });
+  }
+
+  var foundIn = data.found_in || "digest_sent";
+  var rows = rowsRaw
+    .split(",")
+    .map(function(x) { return Number(String(x || "").trim()); })
+    .filter(function(n) { return n && n >= 2; });
+
+  for (var i = 0; i < rows.length; i++) {
+    // Only this action is called after the digest message was successfully sent.
+    setSheetValue(sheet, rows[i], headerMap, "Type", "digest");
+    setSheetValue(sheet, rows[i], headerMap, "Status", "done");
+    setSheetValue(sheet, rows[i], headerMap, "Found In", foundIn);
+  }
+
+  return jsonResponse({
+    status: "ok",
+    rows: rows,
+    found_in: foundIn
+  });
+}
+
+
+
+// ======================
+// MONTHLY EDITORIAL STATS — V51
+// ======================
+
+var MONTHLY_STATS_SENT_PREFIX = "monthly_stats_sent_";
+var MONTHLY_STATS_MONTH_NAMES_RU = [
+  "Январь","Февраль","Март","Апрель","Май","Июнь",
+  "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"
+];
+
+var MONTHLY_STATS_CHANNEL_ORDER = [
+  "chto_music_podval","chto_music_indie","chto_music_folk","chto_music_rock",
+  "chto_music_hiphop","chto_music_electronica","chto_music_pop","chto_music"
+];
+
+var MONTHLY_STATS_CHANNEL_LABELS = {
+  "chto_music_podval": "АНДЕРГРАУНД",
+  "chto_music_indie": "ИНДИ",
+  "chto_music_folk": "ФОЛК",
+  "chto_music_rock": "РОК",
+  "chto_music_hiphop": "ХИП-ХОП",
+  "chto_music_electronica": "ЭЛЕКТРОНИКА",
+  "chto_music_pop": "ПОП",
+  "chto_music": "ГЛАВНАЯ"
+};
+
+
+function normalizeMonthlyStatsChannel(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\/(www\.)?t\.me\//, "")
+    .replace(/^@/, "")
+    .replace(/\/+$/, "")
+    .trim() || "(без канала)";
+}
+
+
+function parseMonthlyStatsDate(value) {
+  if (!value) return null;
+
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return value;
+  }
+
+  var text = String(value || "").trim();
+  if (!text) return null;
+
+  var iso = text.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T].*)?$/);
+  if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+
+  var ru = text.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+.*)?$/);
+  if (ru) return new Date(Number(ru[3]), Number(ru[2]) - 1, Number(ru[1]));
+
+  var parsed = new Date(text);
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+
+function monthlyStatsKey(dateValue) {
+  var y = dateValue.getFullYear();
+  var m = dateValue.getMonth() + 1;
+  return y + "-" + (m < 10 ? "0" : "") + m;
+}
+
+
+function buildMonthlyStatsReports(values) {
+  var groups = {};
+
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    var d = parseMonthlyStatsDate(row[2]); // C = Date
+    if (!d) continue;
+
+    var key = monthlyStatsKey(d);
+    if (!groups[key]) {
+      groups[key] = {
+        key: key,
+        year: d.getFullYear(),
+        month_number: d.getMonth() + 1,
+        month_name: MONTHLY_STATS_MONTH_NAMES_RU[d.getMonth()],
+        total: 0,
+        channel_counts: {},
+        author_counts: {}
+      };
+    }
+
+    var g = groups[key];
+    g.total++;
+
+    var channel = normalizeMonthlyStatsChannel(row[1]); // B = Channel
+    g.channel_counts[channel] = (g.channel_counts[channel] || 0) + 1;
+
+    var author = String(row[6] || "").trim() || "Без автора"; // G = Author
+    g.author_counts[author] = (g.author_counts[author] || 0) + 1;
+  }
+
+  var keys = Object.keys(groups).sort();
+  var reports = [];
+
+  for (var k = 0; k < keys.length; k++) {
+    var g = groups[keys[k]];
+    var channels = [];
+    var used = {};
+
+    for (var c = 0; c < MONTHLY_STATS_CHANNEL_ORDER.length; c++) {
+      var ch = MONTHLY_STATS_CHANNEL_ORDER[c];
+      var n = Number(g.channel_counts[ch] || 0);
+      if (!n) continue;
+      channels.push({
+        channel: ch,
+        label: MONTHLY_STATS_CHANNEL_LABELS[ch] || ch,
+        count: n
+      });
+      used[ch] = true;
+    }
+
+    Object.keys(g.channel_counts).sort().forEach(function(ch) {
+      if (used[ch]) return;
+      channels.push({
+        channel: ch,
+        label: ch === "(без канала)" ? "БЕЗ КАНАЛА" : ch,
+        count: Number(g.channel_counts[ch] || 0)
+      });
+    });
+
+    var authors = Object.keys(g.author_counts).map(function(name) {
+      return { author: name, count: Number(g.author_counts[name] || 0) };
+    });
+
+    authors.sort(function(a, b) {
+      if (b.count !== a.count) return b.count - a.count;
+      return String(a.author).localeCompare(String(b.author), "ru");
+    });
+
+    reports.push({
+      key: g.key,
+      year: g.year,
+      month_number: g.month_number,
+      month_name: g.month_name,
+      total: g.total,
+      channels: channels,
+      authors: authors
+    });
+  }
+
+  return reports;
+}
+
+
+function getMonthlyStats(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONTENT_SHEET_NAME);
+  if (!sheet) return jsonResponse({ error: "Content sheet not found", sheet: CONTENT_SHEET_NAME });
+
+  var reports = buildMonthlyStatsReports(sheet.getDataRange().getValues());
+  var currentKey = monthlyStatsKey(new Date());
+  var props = PropertiesService.getScriptProperties();
+
+  var completed = reports.filter(function(r) { return r.key < currentKey; });
+  var unsent = completed.filter(function(r) {
+    return props.getProperty(MONTHLY_STATS_SENT_PREFIX + r.key) !== "1";
+  });
+
+  return jsonResponse({
+    status: "ok",
+    script_version: "V51_MONTHLY_STATS",
+    current_month: currentKey,
+    available_completed_months: completed.length,
+    reports: unsent
+  });
+}
+
+
+function markMonthlyStatsSent(data) {
+  var monthKey = String(data.month_key || "").trim();
+  if (!/^\d{4}-\d{2}$/.test(monthKey)) {
+    return jsonResponse({ error: "Invalid month_key", month_key: monthKey });
+  }
+
+  PropertiesService.getScriptProperties()
+    .setProperty(MONTHLY_STATS_SENT_PREFIX + monthKey, "1");
+
+  return jsonResponse({
+    status: "ok",
+    script_version: "V51_MONTHLY_STATS",
+    month_key: monthKey,
+    telegram_message_id: String(data.telegram_message_id || "")
+  });
+}
+
+
+
+// ======================
+// BOT MESSAGE CLEANUP — persistent queue
+// ======================
+function getOrCreateCleanupSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CLEANUP_SHEET_NAME);
+  var headers = ["ID", "Status", "Delete At", "Chat ID", "Message ID", "Created At", "Deleted At", "Error"];
+  if (!sheet) {
+    sheet = ss.insertSheet(CLEANUP_SHEET_NAME);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  } else {
+    ensureHeaders(sheet, headers);
+  }
+  return sheet;
+}
+
+function addCleanupTask(data) {
+  var task = data.task || {};
+  var id = String(task.id || "").trim();
+  if (!id) return jsonResponse({ error: "Cleanup task ID is empty" });
+  var sheet = getOrCreateCleanupSheet();
+  var map = getHeaderMap(sheet);
+  var existing = findCleanupRowById(sheet, id);
+  if (existing) return jsonResponse({ status: "exists", id: id, row: existing });
+  var row = new Array(sheet.getLastColumn()).fill("");
+  setByHeader(row, map, "ID", id);
+  setByHeader(row, map, "Status", "scheduled");
+  setByHeader(row, map, "Delete At", String(task.delete_at || ""));
+  setByHeader(row, map, "Chat ID", String(task.chat_id || ""));
+  setByHeader(row, map, "Message ID", String(task.message_id || ""));
+  setByHeader(row, map, "Created At", formatDate(new Date()));
+  sheet.appendRow(row);
+  return jsonResponse({ status: "ok", id: id });
+}
+
+function getDueCleanupTasks(e) {
+  var limit = Number((e && e.parameter && e.parameter.limit) || 50);
+  if (!limit || limit < 1) limit = 50;
+  var sheet = getOrCreateCleanupSheet();
+  var map = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+  var now = new Date();
+  var tasks = [];
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    if (String(getValue(row, map, "Status") || "").toLowerCase().trim() !== "scheduled") continue;
+    var deleteAt = parseSheetDate(getValue(row, map, "Delete At"));
+    if (!deleteAt || deleteAt.getTime() > now.getTime()) continue;
+    tasks.push({
+      id: String(getValue(row, map, "ID") || ""),
+      chat_id: String(getValue(row, map, "Chat ID") || ""),
+      message_id: String(getValue(row, map, "Message ID") || ""),
+      delete_at: String(getValue(row, map, "Delete At") || "")
+    });
+    if (tasks.length >= limit) break;
+  }
+  return jsonResponse({ status: "ok", count: tasks.length, tasks: tasks });
+}
+
+function findCleanupRowById(sheet, id) {
+  var map = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+  for (var i = 1; i < values.length; i++) {
+    if (String(getValue(values[i], map, "ID") || "") === String(id)) return i + 1;
+  }
+  return 0;
+}
+
+function markCleanupDone(data) {
+  var id = String(data.id || "").trim();
+  if (!id) return jsonResponse({ error: "Cleanup ID is empty" });
+  var sheet = getOrCreateCleanupSheet();
+  var map = getHeaderMap(sheet);
+  var rowNumber = findCleanupRowById(sheet, id);
+  if (!rowNumber) return jsonResponse({ error: "Cleanup task not found", id: id });
+  setSheetValue(sheet, rowNumber, map, "Status", "done");
+  setSheetValue(sheet, rowNumber, map, "Deleted At", formatDate(new Date()));
+  setSheetValue(sheet, rowNumber, map, "Error", String(data.error || ""));
+  return jsonResponse({ status: "ok", id: id });
+}
+
+
+// ======================
+// SCHEDULED AUTOPUBLISH
+// ======================
+
+var SCHEDULE_HEADERS = [
+  "ID",
+  "Status",
+  "Scheduled At",
+  "Genre",
+  "Target Channel",
+  "Preview Chat ID",
+  "Preview Message ID",
+  "Thread ID",
+  "Requested By",
+  "Preview JSON",
+  "Created At",
+  "Published At",
+  "Published Message ID",
+  "Published Link",
+  "Error",
+  "Failed At"
+];
+
+function getOrCreateScheduleSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SCHEDULE_SHEET_NAME);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(SCHEDULE_SHEET_NAME);
+  }
+
+  ensureHeaders(sheet, SCHEDULE_HEADERS);
+  return sheet;
+}
+
+function addScheduledPost(data) {
+  var job = data.job || {};
+  var id = String(job.id || "").trim();
+
+  if (!id) {
+    return jsonResponse({ error: "Scheduled post ID is required" });
+  }
+
+  var sheet = getOrCreateScheduleSheet();
+  var map = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+
+  for (var i = 1; i < values.length; i++) {
+    if (String(getValue(values[i], map, "ID") || "") === id) {
+      return jsonResponse({ status: "duplicate", id: id, row: i + 1 });
+    }
+  }
+
+  var row = new Array(sheet.getLastColumn()).fill("");
+  setByHeader(row, map, "ID", id);
+  setByHeader(row, map, "Status", "scheduled");
+  setByHeader(row, map, "Scheduled At", String(job.scheduled_at || ""));
+  setByHeader(row, map, "Genre", String(job.genre || ""));
+  setByHeader(row, map, "Target Channel", String(job.target_channel || ""));
+  setByHeader(row, map, "Preview Chat ID", String(job.source_chat_id || ""));
+  setByHeader(row, map, "Preview Message ID", String(job.source_message_id || ""));
+  setByHeader(row, map, "Thread ID", String(job.thread_id || ""));
+  setByHeader(row, map, "Requested By", String(job.requested_by || ""));
+  setByHeader(row, map, "Preview JSON", JSON.stringify(job.preview || {}));
+  setByHeader(row, map, "Created At", new Date().toISOString());
+
+  sheet.appendRow(row);
+
+  return jsonResponse({ status: "ok", id: id, row: sheet.getLastRow() });
+}
+
+function getDueScheduledPosts(e) {
+  var sheet = getOrCreateScheduleSheet();
+  var map = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+  var now = new Date();
+  var limit = Number((e && e.parameter && e.parameter.limit) || 20);
+  if (!limit || limit < 1) limit = 20;
+  if (limit > 100) limit = 100;
+
+  var jobs = [];
+
+  for (var i = 1; i < values.length && jobs.length < limit; i++) {
+    var row = values[i];
+    var status = String(getValue(row, map, "Status") || "").toLowerCase().trim();
+    if (status !== "scheduled") continue;
+
+    var scheduledRaw = getValue(row, map, "Scheduled At");
+    var scheduledAt = parseSheetDate(scheduledRaw);
+    if (!scheduledAt || scheduledAt.getTime() > now.getTime()) continue;
+
+    var previewRaw = String(getValue(row, map, "Preview JSON") || "");
+    var preview = {};
+    try {
+      preview = previewRaw ? JSON.parse(previewRaw) : {};
+    } catch (err) {
+      preview = {};
+    }
+
+    jobs.push({
+      id: String(getValue(row, map, "ID") || ""),
+      status: status,
+      scheduled_at: String(scheduledRaw || ""),
+      genre: String(getValue(row, map, "Genre") || ""),
+      target_channel: String(getValue(row, map, "Target Channel") || ""),
+      source_chat_id: String(getValue(row, map, "Preview Chat ID") || ""),
+      source_message_id: String(getValue(row, map, "Preview Message ID") || ""),
+      thread_id: String(getValue(row, map, "Thread ID") || ""),
+      requested_by: String(getValue(row, map, "Requested By") || ""),
+      preview: preview,
+      row: i + 1
+    });
+  }
+
+  return jsonResponse({ status: "ok", jobs: jobs, count: jobs.length });
+}
+
+function findScheduleRowById(sheet, id) {
+  var map = getHeaderMap(sheet);
+  var values = sheet.getDataRange().getValues();
+
+  for (var i = 1; i < values.length; i++) {
+    if (String(getValue(values[i], map, "ID") || "") === String(id || "")) {
+      return { row: i + 1, map: map };
+    }
+  }
+
+  return null;
+}
+
+function setScheduleCell(sheet, rowNumber, map, header, value) {
+  var index = map[header];
+  if (index === undefined) return;
+  sheet.getRange(rowNumber, index + 1).setValue(value);
+}
+
+function markScheduledPostPublished(data) {
+  var id = String(data.id || "").trim();
+  var sheet = getOrCreateScheduleSheet();
+  var found = findScheduleRowById(sheet, id);
+
+  if (!found) {
+    return jsonResponse({ error: "Scheduled post not found", id: id });
+  }
+
+  setScheduleCell(sheet, found.row, found.map, "Status", "published");
+  setScheduleCell(sheet, found.row, found.map, "Published At", data.published_at || new Date().toISOString());
+  setScheduleCell(sheet, found.row, found.map, "Published Message ID", data.published_message_id || "");
+  setScheduleCell(sheet, found.row, found.map, "Published Link", data.published_link || "");
+  setScheduleCell(sheet, found.row, found.map, "Error", "");
+  setScheduleCell(sheet, found.row, found.map, "Failed At", "");
+
+  return jsonResponse({ status: "ok", id: id, row: found.row });
+}
+
+function markScheduledPostError(data) {
+  var id = String(data.id || "").trim();
+  var sheet = getOrCreateScheduleSheet();
+  var found = findScheduleRowById(sheet, id);
+
+  if (!found) {
+    return jsonResponse({ error: "Scheduled post not found", id: id });
+  }
+
+  setScheduleCell(sheet, found.row, found.map, "Status", "error");
+  setScheduleCell(sheet, found.row, found.map, "Error", String(data.error || "Unknown error"));
+  setScheduleCell(sheet, found.row, found.map, "Failed At", data.failed_at || new Date().toISOString());
+
+  return jsonResponse({ status: "ok", id: id, row: found.row });
+}
+
+// ======================
+// HELPERS
+// ======================
+
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+function resolveSheetName(data) {
+  var requested = String(data.sheet || data.target_sheet || "").trim();
+
+  if (!requested) {
+    return CONTENT_SHEET_NAME;
+  }
+
+  var lower = requested.toLowerCase();
+
+  if (lower === "predlozhka" || lower === "предложка") {
+    return PREDLOZHKA_SHEET_NAME;
+  }
+
+  if (
+    lower === "content" ||
+    lower === "publications" ||
+    lower === "publikacii" ||
+    lower === "публикации" ||
+    lower === "таблица контента редакции"
+  ) {
+    return CONTENT_SHEET_NAME;
+  }
+
+  return requested;
+}
+
+
+function ensureHeaders(sheet, headersToEnsure) {
+  var lastColumn = sheet.getLastColumn();
+
+  if (lastColumn < 1) return;
+
+  var headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  var normalized = {};
+
+  for (var i = 0; i < headers.length; i++) {
+    normalized[String(headers[i] || "").trim()] = true;
+  }
+
+  var missing = [];
+
+  for (var j = 0; j < headersToEnsure.length; j++) {
+    var header = headersToEnsure[j];
+
+    if (!normalized[header]) {
+      missing.push(header);
+    }
+  }
+
+  if (missing.length > 0) {
+    sheet
+      .getRange(1, lastColumn + 1, 1, missing.length)
+      .setValues([missing]);
+  }
+}
+
+
+function getHeaderMap(sheet) {
+  var lastColumn = sheet.getLastColumn();
+
+  if (lastColumn < 1) return {};
+
+  var headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  var map = {};
+
+  for (var i = 0; i < headers.length; i++) {
+    var name = String(headers[i] || "").trim();
+
+    if (name) {
+      map[name] = i;
+    }
+  }
+
+  return map;
+}
+
+
+function getValue(row, headerMap, headerName) {
+  if (headerMap[headerName] === undefined) {
+    return "";
+  }
+
+  return row[headerMap[headerName]];
+}
+
+
+function setByHeader(row, headerMap, headerName, value) {
+  if (headerMap[headerName] === undefined) {
+    return;
+  }
+
+  row[headerMap[headerName]] = value || "";
+}
+
+
+function setSheetValue(sheet, rowNumber, headerMap, headerName, value) {
+  if (headerMap[headerName] === undefined) {
+    return;
+  }
+
+  sheet.getRange(rowNumber, headerMap[headerName] + 1).setValue(value);
+}
+
+
+function formatDateAndMonth(data) {
+  var monthNamesRu = [
     "Январь",
     "Февраль",
     "Март",
@@ -302,4350 +1858,601 @@ MONTH_NAMES_RU = [
     "Сентябрь",
     "Октябрь",
     "Ноябрь",
-    "Декабрь",
-]
-
-HTTP_TIMEOUT = 30
-DOWNLOAD_TIMEOUT = 120
-UPLOAD_TIMEOUT = 120
-
-app = Flask(__name__)
-
-album_lock = threading.Lock()
-album_buffer: Dict[str, dict] = {}
-processed_media_groups: Dict[str, float] = {}
-processed_single_messages: Dict[int, float] = {}
-
-mapping_cache = {}
-mapping_cache_time = 0
-MAPPING_CACHE_TTL = 60
-
-PROCESSED_TTL_SEC = 6 * 60 * 60
-
-
-def now_ts() -> float:
-    return time.time()
-
-
-def normalize_channel_username(username: str) -> str:
-    return (username or "").strip().lstrip("@")
-
-
-def extract_month_name(timestamp_value) -> str:
-    if not timestamp_value:
-        return ""
-
-    try:
-        dt = datetime.fromtimestamp(int(timestamp_value))
-        return MONTH_NAMES_RU[dt.month - 1]
-    except Exception:
-        return ""
-
-
-def cleanup_processed_maps():
-    cutoff = now_ts() - PROCESSED_TTL_SEC
-    for storage in (processed_media_groups, processed_single_messages):
-        old_keys = [k for k, v in storage.items() if v < cutoff]
-        for k in old_keys:
-            storage.pop(k, None)
-
-
-def load_channel_mapping():
-    global mapping_cache, mapping_cache_time
-
-    if mapping_cache and (time.time() - mapping_cache_time < MAPPING_CACHE_TTL):
-        return mapping_cache
-
-    try:
-        resp = requests.get(
-            WEBHOOK_URL,
-            params={"action": "get_mapping"},
-            timeout=60
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        mapping_cache = data.get("mapping", {})
-        mapping_cache_time = time.time()
-        return mapping_cache
-    except Exception as e:
-        print("MAPPING LOAD ERROR:", str(e), flush=True)
-        return mapping_cache
-
-
-def get_vk_config(channel_username: str):
-    mapping = load_channel_mapping()
-    return mapping.get(channel_username)
-
-
-def telegram_api(method: str, data: Optional[dict] = None) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    response = requests.post(url, data=data or {}, timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram API error in {method}: {result}")
-    return result["result"]
-
-
-def telegram_api_json(method: str, payload: Optional[dict] = None) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    response = requests.post(url, json=payload or {}, timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram API error in {method}: {result}")
-    return result["result"]
-
-
-def tg_get_file_url(file_id: str) -> str:
-    file_info = telegram_api("getFile", {"file_id": file_id})
-    file_path = file_info["file_path"]
-    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-
-
-def tg_download_file(file_id: str) -> str:
-    file_url = tg_get_file_url(file_id)
-    resp = requests.get(file_url, timeout=DOWNLOAD_TIMEOUT)
-    resp.raise_for_status()
-
-    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
-    guessed_ext = mimetypes.guess_extension(content_type) if content_type else None
-    suffix = guessed_ext or ""
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(resp.content)
-    tmp.flush()
-    tmp.close()
-    return tmp.name
-
-
-def vk_api(method: str, params: dict, token: str) -> dict:
-    url = f"https://api.vk.com/method/{method}"
-    payload = {
-        **params,
-        "access_token": str(token).strip(),
-        "v": "5.199",
-    }
-
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            resp = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-
-            if "error" in data:
-                raise RuntimeError(f"VK API error in {method}: {data['error']}")
-
-            return data["response"]
-
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status in (502, 503, 504) and attempt < 2:
-                print(f"VK RETRY {method}: HTTP {status}, attempt={attempt + 1}", flush=True)
-                time.sleep(2 * (attempt + 1))
-                last_error = e
-                continue
-            raise
-
-        except requests.exceptions.RequestException as e:
-            if attempt < 2:
-                print(f"VK RETRY {method}: network error, attempt={attempt + 1}, error={e}", flush=True)
-                time.sleep(2 * (attempt + 1))
-                last_error = e
-                continue
-            raise
-
-    if last_error:
-        raise last_error
-
-    raise RuntimeError(f"VK API failed in {method} with unknown error")
-
-
-def vk_upload_wall_photo(file_path: str, group_id: str, token: str) -> str:
-    upload_server = vk_api("photos.getWallUploadServer", {
-        "group_id": group_id
-    }, token)
-
-    with open(file_path, "rb") as photo_file:
-        upload_resp = requests.post(
-            upload_server["upload_url"],
-            files={"photo": (os.path.basename(file_path), photo_file)},
-            timeout=UPLOAD_TIMEOUT
-        )
-
-    upload_resp.raise_for_status()
-    uploaded = upload_resp.json()
-
-    if not all(k in uploaded for k in ("photo", "server", "hash")):
-        raise RuntimeError(f"VK upload bad response: {uploaded}")
-
-    saved = vk_api("photos.saveWallPhoto", {
-        "group_id": group_id,
-        "photo": uploaded["photo"],
-        "server": uploaded["server"],
-        "hash": uploaded["hash"]
-    }, token)
-
-    if not saved:
-        raise RuntimeError("VK photos.saveWallPhoto returned empty response")
-
-    photo_obj = saved[0]
-    return f"photo{photo_obj['owner_id']}_{photo_obj['id']}"
-
-
-def vk_post_to_wall(text: str, attachments: Optional[List[str]], group_id: str, token: str) -> dict:
-    params = {
-        "owner_id": -int(group_id),
-        "from_group": 1,
-        "message": text,
-    }
-
-    if attachments:
-        params["attachments"] = ",".join(attachments)
-
-    return vk_api("wall.post", params, token)
-
-
-def extract_author(text: str) -> str:
-    if not text:
-        return ""
-
-    patterns = [
-        r"(?:Автор|Общалась|Общался)\s*[:\-–—]\s*([^\n\r|]+)",
-        r"(?:Автор|Общалась|Общался)\s+([А-ЯA-ZЁ][^\n\r|]+)",
-        r"\(\s*(?:Автор|Общалась|Общался)\s*[:\-–—]?\s*([^)]+)\)",
-        r"Авторство\s*[:\-–—]\s*([^\n\r|]+)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            author = match.group(1).strip()
-            author = re.sub(r"(Фото|Источник|©).*", "", author, flags=re.IGNORECASE).strip()
-            author = author.strip(" .,:;-–—|")
-            return author
-
-    return ""
-
-
-
-# ======================
-# EDITORIAL CMS SAFE HELPERS
-# ======================
-def normalize_url(url: str) -> str:
-    if not url:
-        return ""
-
-    url = str(url).strip()
-    if not url:
-        return ""
-
-    if url.startswith("www."):
-        url = "https://" + url
-
-    try:
-        parsed = urlparse(url)
-        if not parsed.scheme:
-            parsed = urlparse("https://" + url)
-
-        scheme = (parsed.scheme or "https").lower()
-        netloc = (parsed.netloc or "").lower()
-        path = parsed.path or ""
-
-        clean_query = []
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-            lk = key.lower()
-            if lk.startswith("utm_") or lk in (
-                "fbclid", "gclid", "yclid", "ysclid",
-                "from", "si", "feature", "ref", "ref_src",
-            ):
-                continue
-            clean_query.append((key, value))
-
-        query = "&".join(
-            f"{k}={v}" if v != "" else k
-            for k, v in clean_query
-        )
-
-        return urlunparse((scheme, netloc, path.rstrip("/"), "", query, "")).strip()
-    except Exception:
-        return url
-
-
-def is_yandex_music_link(url: str) -> bool:
-    if not url:
-        return False
-
-    try:
-        parsed = urlparse(url if "://" in url else "https://" + url)
-        host = (parsed.netloc or "").lower()
-        path = (parsed.path or "").lower()
-        return "music.yandex" in host or (host == "yandex.ru" and "/music/" in path)
-    except Exception:
-        return "music.yandex" in url.lower()
-
-
-def is_common_music_link(url: str) -> bool:
-    if not url:
-        return False
-
-    low = url.lower().strip()
-
-    if is_yandex_music_link(low):
-        return False
-
-    excluded = (
-        "t.me/",
-        "telegram.me/",
-        "telegra.ph/",
-        "vk.com/",
-        "youtube.com/",
-        "youtu.be/",
-        "instagram.com/",
-        "docs.google.com/",
-        "drive.google.com/",
-    )
-    if any(domain in low for domain in excluded):
-        return False
-
-    if any(domain in low for domain in COMMON_LINK_DOMAINS):
-        return True
-
-    # Fallback for new smartlink providers:
-    # any external http(s) link can be a Common Link if it is not excluded above.
-    if low.startswith("http://") or low.startswith("https://"):
-        return True
-
-    return False
-
-
-def tg_entity_slice(text: str, offset: int, length: int) -> str:
-    """
-    Telegram entity offsets are UTF-16 code units.
-    This extracts visible URLs safely even if text contains emoji.
-    """
-    try:
-        raw = text.encode("utf-16-le")
-        part = raw[offset * 2:(offset + length) * 2]
-        return part.decode("utf-16-le", errors="ignore")
-    except Exception:
-        try:
-            return text[offset:offset + length]
-        except Exception:
-            return ""
-
-
-def extract_all_links_from_post(post: dict) -> List[str]:
-    text = post.get("text") or post.get("caption") or ""
-    links: List[str] = []
-
-    if text:
-        links.extend(re.findall(r"https?://[^\s<>\]\)\"']+|www\.[^\s<>\]\)\"']+", text))
-
-    for field in ("entities", "caption_entities"):
-        entities = post.get(field) or []
-        for entity in entities:
-            etype = entity.get("type")
-            if etype == "text_link":
-                url = entity.get("url")
-                if url:
-                    links.append(url)
-            elif etype == "url":
-                offset = entity.get("offset")
-                length = entity.get("length")
-                if offset is not None and length is not None:
-                    url = tg_entity_slice(text, int(offset), int(length))
-                    if url:
-                        links.append(url)
-
-    result = []
-    seen = set()
-    for link in links:
-        clean = normalize_url(link)
-        if clean and clean not in seen:
-            seen.add(clean)
-            result.append(clean)
-
-    return result
-
-
-def extract_music_links_from_post(post: dict):
-    yandex_links = []
-    common_links = []
-
-    for link in extract_all_links_from_post(post):
-        if is_yandex_music_link(link):
-            yandex_links.append(link)
-        elif is_common_music_link(link):
-            common_links.append(link)
-
-    return "\n".join(yandex_links), "\n".join(common_links)
-
-
-def get_post_text(post: dict) -> str:
-    return (post.get("text") or post.get("caption") or "").strip()
-
-
-def get_thread_id(post: dict):
-    return post.get("message_thread_id")
-
-
-def get_chat_id(post: dict):
-    return (post.get("chat") or {}).get("id")
-
-
-def get_genre_from_thread(thread_id) -> str:
-    if thread_id is None:
-        return ""
-
-    try:
-        return THREAD_MAP.get(int(thread_id), "")
-    except Exception:
-        return ""
-
-
-def build_message_link_any_chat(post: dict) -> str:
-    chat = post.get("chat") or {}
-    username = normalize_channel_username(chat.get("username", ""))
-    message_id = post.get("message_id")
-    chat_id = chat.get("id")
-
-    if username and message_id:
-        return f"https://t.me/{username}/{message_id}"
-
-    if chat_id and message_id:
-        chat_id_str = str(chat_id)
-        if chat_id_str.startswith("-100"):
-            internal_id = chat_id_str[4:]
-            return f"https://t.me/c/{internal_id}/{message_id}"
-
-    return ""
-
-
-def infer_post_type(text: str) -> str:
-    low = (text or "").lower()
-    if "#сверхновые" in low:
-        return "digest"
-    return "review"
-
-
-def safe_status_for_predlozhka(post_type: str, yandex_link: str, common_link: str) -> str:
-    if post_type == "digest":
-        return "pending"
-    if yandex_link or common_link:
-        return "pending"
-    return "no_link"
-
-
-def debug_custom_emoji_entities(post: dict):
-    """Print custom_emoji_id values from incoming Telegram messages."""
-    if not post:
-        return
-
-    text = post.get("text") or post.get("caption") or ""
-    entities = (post.get("entities") or []) + (post.get("caption_entities") or [])
-
-    for entity in entities:
-        if entity.get("type") != "custom_emoji":
-            continue
-
-        custom_emoji_id = entity.get("custom_emoji_id")
-        offset = entity.get("offset")
-        length = entity.get("length")
-        visible = ""
-
-        if offset is not None and length is not None:
-            visible = tg_entity_slice(text, int(offset), int(length))
-
-        print(
-            "CUSTOM EMOJI FOUND:",
-            {
-                "custom_emoji_id": custom_emoji_id,
-                "visible": visible,
-                "from_id": (post.get("from") or {}).get("id"),
-                "from_username": (post.get("from") or {}).get("username"),
-                "chat_id": get_chat_id(post),
-                "message_id": post.get("message_id"),
-            },
-            flush=True,
-        )
-
-
-def _send_emojipack_lines(chat_id, lines: List[str], thread_id=None):
-    """Send HTML lines in safe Telegram-sized chunks."""
-    chunks = []
-    current = []
-    current_len = 0
-
-    for line in lines:
-        extra = len(line) + (1 if current else 0)
-        if current and current_len + extra > 3400:
-            chunks.append("\n".join(current))
-            current = [line]
-            current_len = len(line)
-        else:
-            current.append(line)
-            current_len += extra
-
-    if current:
-        chunks.append("\n".join(current))
-
-    for chunk in chunks:
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        if thread_id:
-            try:
-                payload["message_thread_id"] = int(thread_id)
-            except Exception:
-                pass
-        result = telegram_api_json("sendMessage", payload)
-        _schedule_result_cleanup(result)
-
-
-def handle_emojipack_command(post: dict) -> bool:
-    """
-    /emojipack [pack_name]
-
-    Loads the custom emoji sticker set through Bot API getStickerSet and
-    prints every custom_emoji_id. Each row also embeds the corresponding
-    custom emoji so the editor can visually match an ID to the icon.
-    """
-    text = get_post_text(post).strip()
-    if not text:
-        return False
-
-    parts = text.split(maxsplit=1)
-    command = parts[0].split("@", 1)[0].casefold()
-    if command != "/emojipack":
-        return False
-
-    chat_id = get_chat_id(post)
-    if not chat_id:
-        return True
-
-    pack_name = parts[1].strip() if len(parts) > 1 and parts[1].strip() else CUSTOM_EMOJI_PACK_NAME
-    thread_id = get_thread_id(post)
-
-    try:
-        sticker_set = telegram_api("getStickerSet", {"name": pack_name})
-        stickers = sticker_set.get("stickers") or []
-
-        rows = []
-        for index, sticker in enumerate(stickers, start=1):
-            custom_emoji_id = str(sticker.get("custom_emoji_id") or "").strip()
-            if not custom_emoji_id:
-                continue
-
-            visible = str(sticker.get("emoji") or "🙂")
-            safe_visible = html_escape(visible)
-            rows.append(
-                f'{index}. <tg-emoji emoji-id="{html_escape(custom_emoji_id)}">{safe_visible}</tg-emoji> '
-                f'<code>{html_escape(custom_emoji_id)}</code>'
-            )
-
-            print(
-                "EMOJI PACK ITEM:",
-                {
-                    "pack": pack_name,
-                    "index": index,
-                    "emoji": visible,
-                    "custom_emoji_id": custom_emoji_id,
-                },
-                flush=True,
-            )
-
-        title = sticker_set.get("title") or pack_name
-        header = [
-            f"<b>Набор:</b> {html_escape(title)}",
-            f"<b>Имя:</b> <code>{html_escape(pack_name)}</code>",
-            f"<b>Найдено custom emoji:</b> {len(rows)}",
-            "",
-        ]
-
-        if not rows:
-            header.append("В этом наборе Bot API не вернул custom_emoji_id.")
-
-        _send_emojipack_lines(chat_id, header + rows, thread_id)
-        print(
-            "EMOJI PACK LOADED:",
-            {"pack": pack_name, "title": title, "count": len(rows)},
-            flush=True,
-        )
-    except Exception as e:
-        print("EMOJI PACK ERROR:", {"pack": pack_name, "error": str(e)}, flush=True)
-        payload = {
-            "chat_id": chat_id,
-            "text": (
-                "❌ Не удалось получить набор custom emoji.\n"
-                f"Pack: <code>{html_escape(pack_name)}</code>\n"
-                f"Ошибка: <code>{html_escape(str(e))}</code>"
-            ),
-            "parse_mode": "HTML",
-        }
-        if thread_id:
-            try:
-                payload["message_thread_id"] = int(thread_id)
-            except Exception:
-                pass
-        result = telegram_api_json("sendMessage", payload)
-        _schedule_result_cleanup(result)
-
-    return True
-
-
-def debug_thread_info(post: dict, source: str):
-    try:
-        chat = post.get("chat") or {}
-        print(
-            "🔥 THREAD DEBUG:",
-            {
-                "source": source,
-                "chat_id": chat.get("id"),
-                "chat_title": chat.get("title"),
-                "chat_username": chat.get("username"),
-                "thread_id": post.get("message_thread_id"),
-                "message_id": post.get("message_id"),
-                "from_id": (post.get("from") or {}).get("id"),
-                "from_username": (post.get("from") or {}).get("username"),
-                "from_is_bot": (post.get("from") or {}).get("is_bot"),
-                "text": (post.get("text") or post.get("caption") or "")[:300],
-            },
-            flush=True
-        )
-    except Exception as e:
-        print("THREAD DEBUG ERROR:", str(e), flush=True)
-
-
-
-def is_allowed_predlozhka_chat(post: dict) -> bool:
-    chat_id = get_chat_id(post)
-
-    if chat_id is None:
-        return False
-
-    chat_id_str = str(chat_id)
-
-    if not PREDLOZHKA_ALLOWED_CHAT_IDS:
-        # Extra safe default: if the env is empty, capture nothing.
-        return False
-
-    return chat_id_str in PREDLOZHKA_ALLOWED_CHAT_IDS
-
-
-def is_allowed_predlozhka_thread(post: dict) -> bool:
-    thread_id = get_thread_id(post)
-
-    if thread_id is None:
-        return False
-
-    try:
-        return int(thread_id) in THREAD_MAP
-    except Exception:
-        return False
-
-
-def is_trusted_predlozhka_sender(post: dict) -> bool:
-    """
-    Predlozhka automation must react only to the configured external review bot(s).
-    Human/editor chatter in the forum topics must never be written to Sheets,
-    attached as a cover, or treated as review text.
-    """
-    sender = post.get("from") or {}
-    if not sender.get("is_bot"):
-        return False
-    return str(sender.get("id") or "") in AUTOPUBLISH_TRUSTED_BOT_IDS
-
-
-def send_predlozhka_to_sheets(post: dict):
-    """
-    Writes supergroup/topic messages to the Predlozhka sheet.
-    Disabled by default for safety until Apps Script is updated.
-    """
-    debug_thread_info(post, "message")
-
-    if not is_allowed_predlozhka_chat(post):
-        print(
-            "PREDLOZHKA CAPTURE SKIPPED: chat_id is not allowed",
-            {
-                "chat_id": get_chat_id(post),
-                "allowed": sorted(PREDLOZHKA_ALLOWED_CHAT_IDS),
-                "text": get_post_text(post)[:120],
-            },
-            flush=True
-        )
-        return
-
-    if not is_allowed_predlozhka_thread(post):
-        print(
-            "PREDLOZHKA CAPTURE SKIPPED: thread_id is not allowed",
-            {
-                "chat_id": get_chat_id(post),
-                "thread_id": get_thread_id(post),
-                "allowed_threads": sorted(THREAD_MAP.keys()),
-                "text": get_post_text(post)[:120],
-            },
-            flush=True
-        )
-        return
-
-    if not PREDLOZHKA_CAPTURE_ENABLED:
-        print("PREDLOZHKA CAPTURE DISABLED: set PREDLOZHKA_CAPTURE_ENABLED=1 after Apps Script update", flush=True)
-        return
-
-    if not is_trusted_predlozhka_sender(post):
-        sender = post.get("from") or {}
-        print(
-            "PREDLOZHKA CAPTURE SKIPPED: sender is not trusted review bot",
-            {
-                "from_id": sender.get("id"),
-                "from_username": sender.get("username"),
-                "from_is_bot": sender.get("is_bot"),
-                "thread_id": get_thread_id(post),
-                "text": get_post_text(post)[:120],
-            },
-            flush=True,
-        )
-        return
-
-    text = get_post_text(post)
-    message_id = post.get("message_id")
-    chat = post.get("chat") or {}
-    date_value = post.get("date")
-    media_group_id = post.get("media_group_id", "")
-    thread_id = get_thread_id(post)
-    chat_id = get_chat_id(post)
-    genre = get_genre_from_thread(thread_id)
-
-    yandex_link, common_link = extract_music_links_from_post(post)
-    cover_file_id = extract_image_file_id(post) or ""
-    cover_url = extract_cover_download_url(post) or str(post.get("_editorial_cover_url") or "")
-    post_type = infer_post_type(text)
-    status = safe_status_for_predlozhka(post_type, yandex_link, common_link)
-
-    author = extract_author(text)
-    month = extract_month_name(date_value)
-    link = build_message_link_any_chat(post)
-
-    data = {
-        "sheet": PREDLOZHKA_SHEET_NAME,
-        "title": text,
-        "channel": genre or str(thread_id or ""),
-        "genre": genre,
-        "date": str(date_value),
-        "link": link,
-        "media_group_id": str(media_group_id),
-        "message_id": str(message_id),
-        "chat_id": str(chat_id or ""),
-        "thread_id": str(thread_id or ""),
-        "author": author,
-        "month": month,
-        "type": post_type,
-        "status": status,
-        "yandex_link": yandex_link,
-        "common_link": common_link,
-        "cover_file_id": cover_file_id,
-        "cover_url": cover_url,
-    }
-
-    try:
-        resp = requests.post(WEBHOOK_URL, json=data, timeout=60)
-        print("PREDLOZHKA SHEETS OK:", resp.status_code, resp.text[:300], flush=True)
-        try:
-            payload = resp.json()
-            row_number = payload.get("row")
-            if row_number:
-                post["_editorial_sheet_row"] = int(row_number)
-                print(
-                    "EDITORIAL SHEET ROW LINKED:",
-                    {"row": row_number, "message_id": message_id, "genre": genre},
-                    flush=True,
-                )
-        except Exception as parse_error:
-            print("EDITORIAL SHEET ROW PARSE ERROR:", str(parse_error), flush=True)
-    except Exception as e:
-        print("PREDLOZHKA SHEETS ERROR:", str(e), flush=True)
-
-
-def send_to_sheets(post: dict):
-    text = post.get("text") or post.get("caption") or ""
-    message_id = post.get("message_id")
-    channel = normalize_channel_username((post.get("chat") or {}).get("username", ""))
-    date_value = post.get("date")
-    media_group_id = post.get("media_group_id", "")
-
-    link = f"https://t.me/{channel}/{message_id}" if channel else build_message_link_any_chat(post)
-    author = extract_author(text)
-
-    if not author and channel:
-        author = CHANNEL_CURATORS.get(channel, "")
-
-    month = extract_month_name(date_value)
-
-    thread_id = get_thread_id(post)
-    chat_id = get_chat_id(post)
-    genre = get_genre_from_thread(thread_id)
-    yandex_link, common_link = extract_music_links_from_post(post)
-
-    data = {
-        # Existing fields — keep unchanged for old Apps Script
-        "title": text,
-        "channel": channel,
-        "date": str(date_value),
-        "link": link,
-        "media_group_id": str(media_group_id),
-        "message_id": str(message_id),
-        "author": author,
-        "month": month,
-
-        # New optional fields — old Apps Script safely ignores them
-        "sheet": PUBLISHED_SHEET_NAME,
-        "type": "published",
-        "status": "done",
-        "chat_id": str(chat_id or ""),
-        "thread_id": str(thread_id or ""),
-        "genre": genre,
-        "yandex_link": yandex_link,
-        "common_link": common_link,
-    }
-
-    try:
-        requests.post(WEBHOOK_URL, json=data, timeout=60)
-    except Exception as e:
-        print("SHEETS ERROR:", str(e), flush=True)
-
-def build_link(post: dict) -> str:
-    channel = (post.get("chat") or {}).get("username", "")
-    message_id = post.get("message_id")
-    if channel and message_id:
-        return f"https://t.me/{channel}/{message_id}"
-    return ""
-
-
-def extract_caption_or_text(post: dict) -> str:
-    return (post.get("text") or post.get("caption") or "").strip()
-
-
-def extract_image_file_id(post: dict) -> Optional[str]:
-    photos = post.get("photo") or []
-    if photos:
-        return photos[-1].get("file_id")
-
-    doc = post.get("document") or {}
-    mime_type = (doc.get("mime_type") or "").lower()
-    file_name = (doc.get("file_name") or "").lower()
-
-    if mime_type.startswith("image/"):
-        return doc.get("file_id")
-
-    if file_name.endswith((".jpg", ".jpeg", ".png", ".webp")):
-        return doc.get("file_id")
-
-    return None
-
-
-def append_source_link(text: str, link: str) -> str:
-    if not APPEND_SOURCE_LINK or not link:
-        return text
-    if not text:
-        return link
-    return f"{text}\n\nИсточник: {link}"
-
-
-def debug_post_media(post: dict):
-    print(
-        "MEDIA DEBUG:",
-        {
-            "message_id": post.get("message_id"),
-            "has_photo": bool(post.get("photo")),
-            "has_document": bool(post.get("document")),
-            "document_mime": (post.get("document") or {}).get("mime_type"),
-            "document_name": (post.get("document") or {}).get("file_name"),
-            "has_video": bool(post.get("video")),
-            "has_animation": bool(post.get("animation")),
-            "media_group_id": post.get("media_group_id"),
-        },
-        flush=True
-    )
-
-
-def publish_single_post_to_vk(post: dict):
-    message_id = post.get("message_id")
-    if not message_id:
-        return
-
-    cleanup_processed_maps()
-
-    if message_id in processed_single_messages:
-        print(f"SKIP single duplicate message_id={message_id}", flush=True)
-        return
-
-    channel_username = (post.get("chat") or {}).get("username", "")
-    vk_config = get_vk_config(channel_username)
-    if not vk_config:
-        print(f"NO VK CONFIG FOR CHANNEL: {channel_username}", flush=True)
-        return
-
-    group_id = str(vk_config["group_id"]).strip()
-    token = str(vk_config["token"]).strip()
-
-    print(
-        f"VK CONFIG DEBUG channel={channel_username}, group_id={group_id}, token_prefix={token[:12]}, token_len={len(token)}",
-        flush=True
-    )
-
-    text = extract_caption_or_text(post)
-    link = build_link(post)
-    final_text = append_source_link(text, link)
-
-    image_file_id = extract_image_file_id(post)
-
-    temp_files = []
-    try:
-        attachments = []
-
-        if image_file_id:
-            local_path = tg_download_file(image_file_id)
-            temp_files.append(local_path)
-            attachments.append(vk_upload_wall_photo(local_path, group_id, token))
-
-        vk_result = vk_post_to_wall(
-            final_text,
-            attachments=attachments,
-            group_id=group_id,
-            token=token
-        )
-
-        processed_single_messages[message_id] = now_ts()
-        print(f"VK OK single message_id={message_id}, result={vk_result}", flush=True)
-
-    finally:
-        for path in temp_files:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def publish_album_to_vk(media_group_id: str, items: List[dict]):
-    cleanup_processed_maps()
-
-    if media_group_id in processed_media_groups:
-        print(f"SKIP album duplicate media_group_id={media_group_id}", flush=True)
-        return
-
-    if not items:
-        return
-
-    items_sorted = sorted(items, key=lambda x: x.get("message_id", 0))
-
-    first_post = items_sorted[0]
-    channel_username = (first_post.get("chat") or {}).get("username", "")
-    vk_config = get_vk_config(channel_username)
-    if not vk_config:
-        print(f"NO VK CONFIG FOR CHANNEL: {channel_username}", flush=True)
-        return
-
-    group_id = str(vk_config["group_id"]).strip()
-    token = str(vk_config["token"]).strip()
-
-    print(
-        f"VK CONFIG DEBUG channel={channel_username}, group_id={group_id}, token_prefix={token[:12]}, token_len={len(token)}",
-        flush=True
-    )
-
-    text = ""
-    link = ""
-    for item in items_sorted:
-        candidate = extract_caption_or_text(item)
-        if candidate and not text:
-            text = candidate
-        if not link:
-            link = build_link(item)
-
-    final_text = append_source_link(text, link)
-
-    temp_files = []
-    try:
-        attachments = []
-
-        for item in items_sorted:
-            image_file_id = extract_image_file_id(item)
-            if not image_file_id:
-                continue
-
-            local_path = tg_download_file(image_file_id)
-            temp_files.append(local_path)
-
-            vk_attachment = vk_upload_wall_photo(local_path, group_id, token)
-            attachments.append(vk_attachment)
-
-        if not attachments and final_text:
-            vk_result = vk_post_to_wall(final_text, attachments=None, group_id=group_id, token=token)
-        elif attachments:
-            vk_result = vk_post_to_wall(final_text, attachments=attachments, group_id=group_id, token=token)
-        else:
-            print(f"ALBUM {media_group_id} has no supported content; skipped", flush=True)
-            return
-
-        processed_media_groups[media_group_id] = now_ts()
-        print(f"VK OK album media_group_id={media_group_id}, result={vk_result}", flush=True)
-
-    finally:
-        for path in temp_files:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def finalize_album(media_group_id: str):
-    with album_lock:
-        bundle = album_buffer.pop(media_group_id, None)
-
-    if not bundle:
-        return
-
-    items = bundle.get("items", [])
-    try:
-        publish_album_to_vk(media_group_id, items)
-    except Exception as e:
-        print(f"VK ALBUM ERROR {media_group_id}: {e}", flush=True)
-
-
-def buffer_album_post(post: dict):
-    media_group_id = str(post.get("media_group_id") or "")
-    if not media_group_id:
-        return
-
-    with album_lock:
-        existing = album_buffer.get(media_group_id)
-        if not existing:
-            existing = {
-                "items": [],
-                "timer": None,
-            }
-            album_buffer[media_group_id] = existing
-
-        existing["items"].append(post)
-
-        old_timer = existing.get("timer")
-        if old_timer:
-            old_timer.cancel()
-
-        timer = threading.Timer(ALBUM_DELAY_SEC, finalize_album, args=[media_group_id])
-        timer.daemon = True
-        existing["timer"] = timer
-        timer.start()
-
-
-
-
-# ======================
-# AUTOPUBLISH PREVIEW HELPERS
-# ======================
-def get_autopublish_tz():
-    try:
-        return ZoneInfo(AUTOPUBLISH_TIMEZONE)
-    except Exception:
-        return ZoneInfo("Europe/Moscow")
-
-
-def telegram_api_multipart(method: str, data: dict, files: dict) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    response = requests.post(url, data=data, files=files, timeout=UPLOAD_TIMEOUT)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram API error in {method}: {result}")
-    return result["result"]
-
-
-def resolve_frame_path(genre: str) -> str:
-    """Find the PNG frame in configured/common folders or anywhere inside the repo."""
-    file_name = GENRE_FRAME_FILES.get(genre)
-    if not file_name:
-        return ""
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    alt_names = [file_name, f"{genre}_frame.png", f"{genre}.png"]
-
-    dir_candidates = []
-    raw_dirs = [
-        GENRE_FRAME_DIR,
-        "genre_frames_ready",
-        "genre_frames",
-        os.path.join(script_dir, GENRE_FRAME_DIR),
-        os.path.join(script_dir, "genre_frames_ready"),
-        os.path.join(script_dir, "genre_frames"),
-    ]
-
-    for item in raw_dirs:
-        if not item:
-            continue
-        normalized = item if os.path.isabs(item) else os.path.abspath(item)
-        if normalized not in dir_candidates:
-            dir_candidates.append(normalized)
-
-    if os.path.isfile(GENRE_FRAME_DIR):
-        return GENRE_FRAME_DIR
-
-    for directory in dir_candidates:
-        for candidate_name in alt_names:
-            path = os.path.join(directory, candidate_name)
-            if os.path.isfile(path):
-                print("AUTOPUBLISH FRAME FOUND:", {"genre": genre, "path": path}, flush=True)
-                return path
-
-    # Last-resort recursive search inside the deployed repository.
-    for root, _, files in os.walk(script_dir):
-        lower_map = {name.casefold(): name for name in files}
-        for candidate_name in alt_names:
-            actual = lower_map.get(candidate_name.casefold())
-            if actual:
-                path = os.path.join(root, actual)
-                print("AUTOPUBLISH FRAME FOUND RECURSIVELY:", {"genre": genre, "path": path}, flush=True)
-                return path
-
-    print(
-        "AUTOPUBLISH FRAME SEARCH FAILED:",
-        {"genre": genre, "requested_dir": GENRE_FRAME_DIR, "checked_dirs": dir_candidates, "checked_names": alt_names},
-        flush=True,
-    )
-    return ""
-
-def _is_usable_cover_url(value: str) -> bool:
-    """
-    Reject unresolved bot/template URLs such as [[url_обложка]], {{cover}},
-    including URL-encoded forms. They are not real cover links.
-    """
-    value = (value or "").strip()
-    if not value:
-        return False
-
-    try:
-        decoded = unquote(value)
-    except Exception:
-        decoded = value
-
-    low = decoded.casefold()
-    placeholder_markers = (
-        "[[",
-        "]]",
-        "{{",
-        "}}",
-        "url_облож",
-        "url облож",
-        "cover_url",
-        "cover url",
-    )
-    if any(marker in low for marker in placeholder_markers):
-        return False
-
-    return low.startswith("http://") or low.startswith("https://")
-
-
-def extract_cover_download_url(post: dict) -> str:
-    """
-    Find a real cover URL.
-
-    Priority:
-    1) Telegram text_link/url entity attached to the visible words
-       "скачать обложку";
-    2) visible URL on that service line;
-    3) safe direct image URL from Telegram entities as a fallback.
-
-    This is especially important for #сверхновые: they may arrive without an
-    attached photo, while PuzzleBot/ChtoMusicBot puts the real JPG behind the
-    clickable words "скачать обложку".
-    """
-    # IMPORTANT: entity offsets belong to the ORIGINAL Telegram text.
-    # Do not use get_post_text() here because it strips leading/trailing spaces.
-    text = post.get("text") or post.get("caption") or ""
-    entities = post.get("entities") or post.get("caption_entities") or []
-
-    def entity_visible_text(entity: dict) -> str:
-        try:
-            start_index = _utf16_to_py_index(text, int(entity.get("offset", 0)))
-            end_index = _utf16_to_py_index(
-                text,
-                int(entity.get("offset", 0)) + int(entity.get("length", 0)),
-            )
-            return text[start_index:end_index]
-        except Exception:
-            return ""
-
-    def entity_url(entity: dict) -> str:
-        etype = entity.get("type")
-        if etype == "text_link":
-            return str(entity.get("url") or "").strip()
-        if etype == "url":
-            return entity_visible_text(entity).strip()
-        return ""
-
-    # 1) Best case: hidden URL is attached exactly to "скачать обложку".
-    for entity in entities:
-        visible = entity_visible_text(entity)
-        if "скачать облож" not in visible.casefold():
-            continue
-
-        candidate = entity_url(entity)
-        if _is_usable_cover_url(candidate):
-            print(
-                "COVER LINK FOUND:",
-                {
-                    "source": "telegram_entity_label",
-                    "message_id": post.get("message_id"),
-                    "url": candidate,
-                },
-                flush=True,
-            )
-            return candidate
-
-    # 2) Find the service line and any entity/visible URL located on it.
-    cursor = 0
-    for raw_line in text.splitlines(keepends=True):
-        visible_line = raw_line.rstrip("\r\n")
-        line_start = cursor
-        line_end = line_start + len(visible_line)
-        cursor += len(raw_line)
-
-        if "скачать облож" not in visible_line.casefold():
-            continue
-
-        for entity in entities:
-            try:
-                entity_start = _utf16_to_py_index(text, int(entity.get("offset", 0)))
-                entity_end = _utf16_to_py_index(
-                    text,
-                    int(entity.get("offset", 0)) + int(entity.get("length", 0)),
-                )
-            except Exception:
-                continue
-
-            if entity_start < line_start or entity_end > line_end:
-                continue
-
-            candidate = entity_url(entity)
-            if _is_usable_cover_url(candidate):
-                print(
-                    "COVER LINK FOUND:",
-                    {
-                        "source": "telegram_entity_line",
-                        "message_id": post.get("message_id"),
-                        "url": candidate,
-                    },
-                    flush=True,
-                )
-                return candidate
-
-        match = re.search(r"https?://[^\s<>\]\)\"']+", visible_line)
-        if match:
-            candidate = match.group(0).rstrip(".,;:!?")
-            if _is_usable_cover_url(candidate):
-                print(
-                    "COVER LINK FOUND:",
-                    {
-                        "source": "visible_service_url",
-                        "message_id": post.get("message_id"),
-                        "url": candidate,
-                    },
-                    flush=True,
-                )
-                return candidate
-
-    # 3) Last safe fallback for text-only #сверхновые.
-    # Sometimes the producer bot changes the label, but the entity still points
-    # directly to an image in object storage. Accept only clearly image-like URLs.
-    for entity in entities:
-        candidate = entity_url(entity)
-        if not _is_usable_cover_url(candidate):
-            continue
-
-        decoded = unquote(candidate)
-        low = decoded.casefold()
-        parsed = urlparse(decoded)
-        host = (parsed.netloc or "").casefold()
-        path = (parsed.path or "").casefold()
-
-        image_like = bool(re.search(r"\.(?:jpe?g|png|webp)(?:$|[?#])", low))
-        known_object_storage = (
-            host.endswith("storage.yandexcloud.net")
-            or host.endswith("storage.googleapis.com")
-            or host.endswith("amazonaws.com")
-        )
-
-        if image_like or known_object_storage:
-            print(
-                "COVER LINK FOUND:",
-                {
-                    "source": "image_entity_fallback",
-                    "message_id": post.get("message_id"),
-                    "url": candidate,
-                },
-                flush=True,
-            )
-            return candidate
-
-    return ""
-
-
-def _direct_download_url(url: str) -> str:
-    """Convert common Google Drive share links into direct-download links."""
-    value = (url or "").strip()
-    if not value:
-        return ""
-
-    match = re.search(r"drive\.google\.com/file/d/([^/]+)", value)
-    if match:
-        return f"https://drive.google.com/uc?export=download&id={match.group(1)}"
-
-    parsed = urlparse(value)
-    if "drive.google.com" in (parsed.netloc or "").lower():
-        params = dict(parse_qsl(parsed.query))
-        if params.get("id"):
-            return f"https://drive.google.com/uc?export=download&id={params['id']}"
-
-    return value
-
-
-def download_cover_from_url(url: str) -> str:
-    """Download an image from the cover hyperlink and validate it with Pillow."""
-    direct_url = _direct_download_url(url)
-    if not direct_url:
-        raise RuntimeError("Cover URL is empty")
-
-    response = requests.get(
-        direct_url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; ChtoMusicBot/1.0)"},
-        timeout=DOWNLOAD_TIMEOUT,
-        allow_redirects=True,
-    )
-    response.raise_for_status()
-
-    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
-    suffix = mimetypes.guess_extension(content_type) or ".img"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(response.content)
-    tmp.flush()
-    tmp.close()
-
-    try:
-        with Image.open(tmp.name) as image:
-            image.verify()
-    except Exception:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-        raise RuntimeError(
-            f"Ссылка ‘скачать обложку’ не вернула изображение (Content-Type: {content_type or 'unknown'})"
-        )
-
-    return tmp.name
-
-
-def _clean_frame_inner_edge(frame: Image.Image, cleanup_px: int = None) -> Image.Image:
-    """
-    Remove the tiny white/noisy fringe along the INNER edge of a transparent
-    channel frame.
-
-    Our frame PNGs have a transparent photo window in the middle. Some source
-    frame files contain a 1-3 px anti-aliased / light fringe on the boundary of
-    that window. Because it belongs to the frame itself, placing the photo
-    underneath cannot hide it.
-
-    We detect the transparent center window from the alpha channel and expand
-    that transparent window a few pixels into the frame. Only the inner edge is
-    touched; the outer border and its artwork remain unchanged.
-    """
-    result = frame.convert("RGBA")
-    cleanup = FRAME_EDGE_CLEANUP_PX if cleanup_px is None else max(0, int(cleanup_px))
-
-    if cleanup <= 0:
-        return result
-
-    alpha = result.getchannel("A")
-    width, height = result.size
-    cx, cy = width // 2, height // 2
-    pixels = alpha.load()
-
-    # A normal genre frame must have a transparent center where the photo shows.
-    transparent_threshold = 24
-    if pixels[cx, cy] > transparent_threshold:
-        print(
-            "FRAME EDGE CLEANUP SKIP:",
-            {
-                "reason": "center_not_transparent",
-                "size": result.size,
-                "center_alpha": pixels[cx, cy],
-            },
-            flush=True,
-        )
-        return result
-
-    # Walk from the transparent center toward each side until the actual frame
-    # begins. A noisy white fringe counts as frame here, which is exactly what
-    # we want to trim away.
-    left = cx
-    while left > 0 and pixels[left, cy] <= transparent_threshold:
-        left -= 1
-
-    right = cx
-    while right < width - 1 and pixels[right, cy] <= transparent_threshold:
-        right += 1
-
-    top = cy
-    while top > 0 and pixels[cx, top] <= transparent_threshold:
-        top -= 1
-
-    bottom = cy
-    while bottom < height - 1 and pixels[cx, bottom] <= transparent_threshold:
-        bottom += 1
-
-    # Guard against an unexpected alpha layout.
-    if not (left < cx < right and top < cy < bottom):
-        print(
-            "FRAME EDGE CLEANUP SKIP:",
-            {
-                "reason": "window_not_detected",
-                "size": result.size,
-                "edges": [left, top, right, bottom],
-            },
-            flush=True,
-        )
-        return result
-
-    # Expand the transparent photo window *into* the frame by a few pixels.
-    # This removes the baked-in white sparkle/noise without altering the rest
-    # of the frame.
-    clear_left = max(0, left - cleanup + 1)
-    clear_top = max(0, top - cleanup + 1)
-    clear_right = min(width, right + cleanup)
-    clear_bottom = min(height, bottom + cleanup)
-
-    alpha.paste(
-        0,
-        (clear_left, clear_top, clear_right, clear_bottom),
-    )
-    result.putalpha(alpha)
-
-    print(
-        "FRAME EDGE CLEANUP:",
-        {
-            "px": cleanup,
-            "size": result.size,
-            "window": [clear_left, clear_top, clear_right, clear_bottom],
-        },
-        flush=True,
-    )
-    return result
-
-
-def _prepare_genre_frame(frame_source: Image.Image, target_size) -> Image.Image:
-    """
-    Normalize a genre frame for compositing and clean its inner alpha edge.
-
-    Frames in the repo are already 1280x1280 in normal operation. If a frame
-    ever has a different size, resize it only once here, then clean the edge.
-    """
-    frame = frame_source.convert("RGBA")
-    if frame.size != target_size:
-        frame = frame.resize(target_size, Image.Resampling.LANCZOS)
-    return _clean_frame_inner_edge(frame)
-
-
-def prepare_framed_cover(source_path: str, genre: str) -> str:
-    """Create a 1280x1280 cover and apply the genre PNG frame when configured."""
-    with Image.open(source_path) as source:
-        cover = ImageOps.fit(source.convert("RGB"), (1280, 1280), method=Image.Resampling.LANCZOS)
-        result = cover.convert("RGBA")
-
-    frame_path = resolve_frame_path(genre)
-    if frame_path:
-        with Image.open(frame_path) as frame_source:
-            frame = _prepare_genre_frame(frame_source, (1280, 1280))
-            result = Image.alpha_composite(result, frame)
-            print(
-                "AUTOPUBLISH FRAME APPLIED:",
-                {
-                    "genre": genre,
-                    "frame_path": frame_path,
-                    "source_path": source_path,
-                    "edge_cleanup_px": FRAME_EDGE_CLEANUP_PX,
-                },
-                flush=True,
-            )
-    elif genre in GENRE_FRAME_FILES:
-        # Never send an unframed preview for a genre that must have a frame.
-        raise RuntimeError(
-            f"Не найдена рамка для жанра {genre}. Добавь файл {GENRE_FRAME_FILES.get(genre)} в папку genre_frames."
-        )
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    tmp.close()
-    result.save(tmp.name, "PNG", optimize=True)
-    return tmp.name
-
-
-def normalize_author_name(value: str) -> str:
-    """
-    Normalize editor signatures for reliable custom-emoji matching.
-    Tolerates Telegram/Markdown-style emphasis markers and extra spacing.
-    """
-    value = (value or "").strip()
-    value = re.sub(r"^[*_~`\s]+|[*_~`\s]+$", "", value)
-    value = re.sub(r"\s+", " ", value)
-    return value.casefold()
-
-
-def author_emoji_html(author: str) -> str:
-    normalized = normalize_author_name(author)
-    for known_author, item in AUTHOR_EMOJI_MAP.items():
-        if normalize_author_name(known_author) == normalized:
-            emoji_id = item.get("emoji_id") or ""
-            visible = html_escape(item.get("visible") or "🙂")
-            if emoji_id:
-                return f'<tg-emoji emoji-id="{html_escape(emoji_id)}">{visible}</tg-emoji>'
-    return ""
-
-
-def _utf16_to_py_index(text: str, utf16_offset: int) -> int:
-    """Convert a Telegram UTF-16 entity offset to a Python string index."""
-    if utf16_offset <= 0:
-        return 0
-    units = 0
-    for index, char in enumerate(text):
-        char_units = len(char.encode("utf-16-le")) // 2
-        if units + char_units > utf16_offset:
-            return index
-        units += char_units
-        if units == utf16_offset:
-            return index + 1
-    return len(text)
-
-
-def _render_entity_line_html(text: str, entities: List[dict], line_start: int, line_end: int) -> str:
-    """Render one source line to Telegram HTML while preserving text links and formatting."""
-    line_text = text[line_start:line_end]
-    relevant = []
-
-    for entity in entities or []:
-        try:
-            entity_start = _utf16_to_py_index(text, int(entity.get("offset", 0)))
-            entity_end = _utf16_to_py_index(
-                text,
-                int(entity.get("offset", 0)) + int(entity.get("length", 0)),
-            )
-        except Exception:
-            continue
-
-        # Message entities normally do not span multiple lines. Ignore partial overlaps safely.
-        if entity_start < line_start or entity_end > line_end or entity_start >= entity_end:
-            continue
-
-        relevant.append({
-            **entity,
-            "start": entity_start - line_start,
-            "end": entity_end - line_start,
-        })
-
-    opens = {}
-    closes = {}
-
-    def tags_for(entity: dict):
-        etype = entity.get("type")
-        if etype == "bold":
-            return "<b>", "</b>"
-        if etype == "italic":
-            return "<i>", "</i>"
-        if etype == "underline":
-            return "<u>", "</u>"
-        if etype == "strikethrough":
-            return "<s>", "</s>"
-        if etype == "spoiler":
-            return '<span class="tg-spoiler">', "</span>"
-        if etype == "code":
-            return "<code>", "</code>"
-        if etype == "pre":
-            language = html_escape(entity.get("language") or "")
-            if language:
-                return f'<pre><code class="language-{language}">', "</code></pre>"
-            return "<pre>", "</pre>"
-        if etype == "text_link":
-            url = html_escape(entity.get("url") or "")
-            return (f'<a href="{url}">', "</a>") if url else ("", "")
-        if etype == "url":
-            visible = line_text[entity["start"]:entity["end"]]
-            url = html_escape(visible)
-            return f'<a href="{url}">', "</a>"
-        if etype == "custom_emoji":
-            emoji_id = html_escape(entity.get("custom_emoji_id") or "")
-            return (f'<tg-emoji emoji-id="{emoji_id}">', "</tg-emoji>") if emoji_id else ("", "")
-        return "", ""
-
-    for entity in relevant:
-        open_tag, close_tag = tags_for(entity)
-        if not open_tag:
-            continue
-        opens.setdefault(entity["start"], []).append((entity["end"], open_tag))
-        closes.setdefault(entity["end"], []).append((entity["start"], close_tag))
-
-    parts = []
-    for index in range(len(line_text) + 1):
-        # Close inner entities first.
-        for _, tag in sorted(closes.get(index, []), key=lambda item: item[0], reverse=True):
-            parts.append(tag)
-        # Open outer entities first.
-        for _, tag in sorted(opens.get(index, []), key=lambda item: item[0], reverse=True):
-            parts.append(tag)
-        if index < len(line_text):
-            parts.append(html_escape(line_text[index]))
-
-    return "".join(parts)
-
-
-def _clean_publish_lines(text: str):
-    """Return retained source lines; move public channel @mentions to the bottom."""
-    retained = []
-    bottom_mentions = []
-    cursor = 0
-
-    for raw_line in text.splitlines(keepends=True):
-        visible = raw_line.rstrip("\r\n")
-        start = cursor
-        end = start + len(visible)
-        cursor += len(raw_line)
-
-        stripped = visible.strip()
-        low = stripped.casefold()
-
-        if not stripped:
-            retained.append({"text": "", "start": start, "end": end})
-            continue
-
-        # Lines explicitly marked for deletion must never reach the channel.
-        if "удалить перед публикацией" in low:
-            continue
-
-        # A plain @channel line is public and must remain, but always at the bottom.
-        if low.startswith("@"):
-            bottom_mentions.append({"text": visible, "start": start, "end": end})
-            continue
-
-        # The cover-download control is used internally and removed from the caption.
-        if "скачать облож" in low:
-            continue
-
-        retained.append({"text": visible, "start": start, "end": end})
-
-    # Remove leading/trailing and repeated empty lines.
-    compact = []
-    for item in retained:
-        if not item["text"].strip():
-            if not compact or not compact[-1]["text"].strip():
-                continue
-        compact.append(item)
-    while compact and not compact[-1]["text"].strip():
-        compact.pop()
-
-    if bottom_mentions:
-        if compact and compact[-1]["text"].strip():
-            compact.append({"text": "", "start": 0, "end": 0})
-        compact.extend(bottom_mentions)
-
-    return compact
-
-
-def custom_emoji_html(config: Optional[dict]) -> str:
-    config = config or {}
-    emoji_id = str(config.get("emoji_id") or "").strip()
-    visible = str(config.get("visible") or "✨")
-    if not emoji_id:
-        return html_escape(visible)
-    return f'<tg-emoji emoji-id="{html_escape(emoji_id)}">{html_escape(visible)}</tg-emoji>'
-
-
-def genre_emoji_html(genre: str) -> str:
-    return custom_emoji_html(GENRE_EMOJI_MAP.get((genre or "").strip()))
-
-
-def liked_section_emoji_html() -> str:
-    return custom_emoji_html(LIKED_SECTION_EMOJI)
-
-
-def _strip_html_for_length(value: str) -> str:
-    value = re.sub(r"<[^>]+>", "", value or "")
-    return unescape(value)
-
-
-def _line_is_liked_heading(value: str) -> bool:
-    clean = re.sub(r"\s+", " ", (value or "").strip()).casefold()
-    return bool(re.match(r"^что понравилось\s*[?:]?(?:\s|$)", clean))
-
-
-def _looks_like_release_title(value: str) -> bool:
-    clean = re.sub(r"\s+", " ", (value or "").strip())
-    if not clean:
-        return False
-    return bool(re.search(r"\S\s+[—–-]\s+\S", clean))
-
-
-def _render_liked_heading_html(value: str) -> str:
-    """
-    Editorial rule:
-    only the words "Что понравилось" are bold.
-    The colon/question mark and the actual answer remain normal.
-    """
-    raw = value or ""
-    match = re.match(
-        r"^(\s*)(что понравилось)(\s*)([?:]?)(.*)$",
-        raw,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return html_escape(raw)
-
-    leading, label, spacing, punctuation, rest = match.groups()
-    return (
-        f"{html_escape(leading)}"
-        f"<b>{html_escape(label)}</b>"
-        f"{html_escape(spacing)}"
-        f"{html_escape(punctuation)}"
-        f"{html_escape(rest)}"
-    )
-
-
-def build_publish_caption(post: dict, genre: str = "") -> str:
-    """Build a ready editorial draft while preserving source formatting and links."""
-    text = get_post_text(post)
-    entities = post.get("entities") or post.get("caption_entities") or []
-    author = extract_author(text)
-    emoji_html = author_emoji_html(author)
-    lines = _clean_publish_lines(text)
-
-    meaningful_indexes = [i for i, item in enumerate(lines) if item["text"].strip()]
-
-    # The genre disc belongs ONLY to the Artist — Track line. It must never be
-    # inserted into a quote just because the first semantic line is a teaser.
-    title_index = next(
-        (i for i in meaningful_indexes if _looks_like_release_title(lines[i]["text"])),
-        None,
-    )
-
-    # Editorial rule: the quote is ALWAYS the first meaningful retained line.
-    # The genre disc is independent and stays only on the Artist — Track line.
-    quote_index = meaningful_indexes[0] if meaningful_indexes else None
-
-    rendered = []
-    author_replaced = False
-    previous_was_service_link = False
-
-    def ensure_blank_line():
-        if rendered and rendered[-1] != "":
-            rendered.append("")
-
-    def is_service_link_line(value: str) -> bool:
-        low = re.sub(r"\s+", " ", (value or "").strip()).casefold()
-        markers = (
-            "вконтакте",
-            "telegram",
-            "яндекс музыка",
-            "слушать везде",
-            "слушать на всех площадках",
-        )
-        return any(marker in low for marker in markers)
-
-    for index, item in enumerate(lines):
-        if not item["text"].strip():
-            ensure_blank_line()
-            previous_was_service_link = False
-            continue
-
-        raw_line = item["text"]
-        line_html = _render_entity_line_html(text, entities, item["start"], item["end"])
-        is_title = index == title_index
-        is_quote = index == quote_index
-        is_liked = _line_is_liked_heading(raw_line)
-        is_author = bool(re.match(r"^\s*Автор\s*[:\-–—]", raw_line, flags=re.IGNORECASE))
-        is_mention = raw_line.strip().startswith("@")
-        is_service = is_service_link_line(raw_line)
-
-        # Match the editorial layout used in the channels:
-        # quote → blank → Artist — Track → blank → review paragraphs.
-        if is_title:
-            ensure_blank_line()
-
-        # Section boundaries should be visually separated even if the source
-        # message did not contain an empty line there.
-        if is_liked or is_author or is_mention:
-            ensure_blank_line()
-
-        # Service links are one compact block: blank before the first line,
-        # but no blank line between "ВКонтакте | Telegram" and
-        # "Яндекс Музыка | Слушать везде".
-        if is_service and not previous_was_service_link:
-            ensure_blank_line()
-
-        if is_title:
-            # Editorial rule: the full Artist — Track title is always bold,
-            # regardless of whether the source bot supplied a bold entity.
-            line_html = f"<b>{line_html}</b>"
-
-            disc = genre_emoji_html(genre)
-            if disc and not raw_line.lstrip().startswith("💿"):
-                line_html = f"{disc} {line_html}"
-
-        if is_liked:
-            # Do not inherit accidental bold from the source for the whole line.
-            # Only the words "Что понравилось" are bold; the answer is normal.
-            line_html = _render_liked_heading_html(raw_line)
-
-            marker = liked_section_emoji_html()
-            if marker:
-                line_html = f"{marker} {line_html}"
-
-        if is_author:
-            if emoji_html:
-                line_html = f"{emoji_html} {line_html}"
-            author_replaced = True
-
-        if is_quote:
-            line_html = f"<blockquote>{line_html}</blockquote>"
-
-        rendered.append(line_html)
-
-        # Always leave breathing room after the quote/title/liked section/author.
-        if is_quote or is_title or is_liked or is_author:
-            ensure_blank_line()
-
-        previous_was_service_link = is_service
-
-    if author and emoji_html and not author_replaced:
-        ensure_blank_line()
-        rendered.append(f"{emoji_html} Автор: {html_escape(author)}")
-        ensure_blank_line()
-
-    # Avoid leading/trailing/multiple blank lines while keeping one empty line
-    # between editorial blocks and source paragraphs.
-    compact_rendered = []
-    for value in rendered:
-        if value == "":
-            if not compact_rendered or compact_rendered[-1] == "":
-                continue
-        compact_rendered.append(value)
-    while compact_rendered and compact_rendered[-1] == "":
-        compact_rendered.pop()
-
-    return "\n".join(compact_rendered).strip()[:3900]
-
-
-def _copy_signature(row_number: int, expires_at: int) -> str:
-    payload = f"{int(row_number)}:{int(expires_at)}".encode("utf-8")
-    return hmac.new(BOT_TOKEN.encode("utf-8"), payload, hashlib.sha256).hexdigest()[:32]
-
-
-def _build_copy_url(row_number) -> str:
-    if not EDITORIAL_COPY_BASE_URL or not row_number:
-        return ""
-    try:
-        row_number = int(row_number)
-    except Exception:
-        return ""
-    expires_at = int(time.time()) + EDITORIAL_COPY_LINK_TTL_SEC
-    signature = _copy_signature(row_number, expires_at)
-    return f"{EDITORIAL_COPY_BASE_URL}/editorial-copy/{row_number}?exp={expires_at}&sig={signature}"
-
-
-def _plain_publish_text(html_text: str) -> str:
-    return _strip_html_for_length(html_text).strip()
-
-
-def build_draft_buttons(genre: str = "", html_text: str = "", row_number=None) -> dict:
-    pending_data = f"pending:{genre}" if genre else "pending:all"
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "⬇️ Скачать обложку", "callback_data": "draft_cover"},
-            ],
-            [
-                {"text": "📚 Невышедшие посты", "callback_data": pending_data},
-            ],
-        ]
-    }
-
-def _draft_parts_key(post: dict) -> str:
-    return f"{get_chat_id(post)}:{get_thread_id(post)}"
-
-
-def _is_trusted_editorial_sender(post: dict) -> bool:
-    return is_trusted_predlozhka_sender(post)
-
-
-def _has_meaningful_publish_text(post: dict) -> bool:
-    text = get_post_text(post)
-    if not text:
-        return False
-    if infer_post_type(text) == "digest":
-        return False
-
-    try:
-        cleaned = _clean_publish_lines(text)
-    except Exception:
-        cleaned = [{"text": line} for line in text.splitlines()]
-
-    for item in cleaned:
-        value = str(item.get("text") or "").strip()
-        if not value:
-            continue
-        if value.startswith("#"):
-            continue
-        low = value.casefold()
-        if "скачать облож" in low or "удалить перед публикацией" in low:
-            continue
-        return True
-    return False
-
-
-def _post_has_cover_source(post: dict) -> bool:
-    return bool(extract_image_file_id(post) or extract_cover_download_url(post))
-
-
-def _prune_editorial_draft_parts(now_value: Optional[float] = None):
-    now_value = now_value or now_ts()
-    cutoff = now_value - EDITORIAL_DRAFT_PARTS_TTL_SEC
-    for key in [k for k, item in editorial_draft_parts.items() if float(item.get("updated_at") or 0) < cutoff]:
-        editorial_draft_parts.pop(key, None)
-
-
-def _utf16_units(value: str) -> int:
-    return len((value or "").encode("utf-16-le")) // 2
-
-
-def _synthetic_text_link_entities(text: str, yandex_link: str = "", common_link: str = "") -> List[dict]:
-    """Rebuild the two editorial music links when a draft has to be recovered from Sheets."""
-    entities: List[dict] = []
-    targets = [
-        ("Яндекс Музыка", first_link(yandex_link)),
-        ("Слушать везде", first_link(common_link)),
-    ]
-    low = (text or "").casefold()
-    used = set()
-    for label, url in targets:
-        if not url:
-            continue
-        start = low.find(label.casefold())
-        if start < 0:
-            continue
-        key = (start, label)
-        if key in used:
-            continue
-        used.add(key)
-        entities.append({
-            "type": "text_link",
-            "offset": _utf16_units(text[:start]),
-            "length": _utf16_units(text[start:start + len(label)]),
-            "url": url,
-        })
-    return entities
-
-
-def _recover_draft_parts_from_sheet(row_number, current_post: dict):
-    """Recover review text/cover from the authoritative Predlozhka row after restart or out-of-order updates."""
-    if not row_number:
-        return None, None
-    try:
-        item = sheets_get("get_review", {"row": str(row_number)})
-    except Exception as e:
-        print("EDITORIAL SHEET RECOVERY ERROR:", {"row": row_number, "error": str(e)}, flush=True)
-        return None, None
-
-    if item.get("status") != "ok":
-        print("EDITORIAL SHEET RECOVERY SKIP:", {"row": row_number, "response": item}, flush=True)
-        return None, None
-
-    raw_text = str(item.get("title") or "").strip()
-    text_post = None
-    if raw_text and infer_post_type(raw_text) != "digest":
-        text_post = {
-            "message_id": item.get("message_id") or current_post.get("message_id"),
-            "chat": current_post.get("chat") or {"id": item.get("chat_id")},
-            "message_thread_id": current_post.get("message_thread_id") or item.get("thread_id"),
-            "from": current_post.get("from") or {},
-            "text": raw_text,
-            "entities": _synthetic_text_link_entities(
-                raw_text,
-                str(item.get("yandex_link") or ""),
-                str(item.get("common_link") or ""),
-            ),
-            "_editorial_sheet_row": row_number,
-        }
-
-    cover_file_id = str(item.get("cover_file_id") or "").strip()
-    cover_url = str(item.get("cover_url") or "").strip()
-    cover_post = None
-    if cover_file_id or cover_url:
-        cover_post = {
-            "message_id": current_post.get("message_id"),
-            "chat": current_post.get("chat") or {"id": item.get("chat_id")},
-            "message_thread_id": current_post.get("message_thread_id") or item.get("thread_id"),
-            "from": current_post.get("from") or {},
-            "text": "",
-            "_editorial_sheet_row": row_number,
-        }
-        if cover_file_id:
-            cover_post["photo"] = [{"file_id": cover_file_id}]
-        if cover_url:
-            cover_post["_editorial_cover_url"] = cover_url
-
-    print(
-        "EDITORIAL SHEET RECOVERY:",
-        {
-            "row": row_number,
-            "has_text": bool(text_post),
-            "has_cover": bool(cover_post),
-            "cover_file": bool(cover_file_id),
-            "cover_url": bool(cover_url),
-        },
-        flush=True,
-    )
-    return text_post, cover_post
-
-
-def _can_adopt_unclaimed_cover_first(
-    previous: dict,
-    incoming_text_post: dict,
-    row_number,
-    now_value: float,
-) -> bool:
-    """
-    Safe cover-first exception for PuzzleBot/ChtoMusicBot review delivery.
-
-    In some topics (notably Главред), Telegram sends:
-        1) standalone cover photo
-        2) review text immediately after it
-
-    The cover arrives before the Predlozhka row exists, so it has no sheet_row.
-    Strict same-row pairing must normally reject such an "unknown" cover.
-
-    We adopt it ONLY when all of the following are true:
-    - cached entry has a cover but no text and no resolved sheet row;
-    - cover sender is our trusted editorial bot;
-    - incoming text already has its newly created sheet row;
-    - text message_id is exactly cover message_id + 1;
-    - parts arrived within 90 seconds.
-
-    This does NOT restore the old loose "within 3 messages / 5 minutes" heuristic.
-    """
-    if not previous or not row_number:
-        return False
-
-    if previous.get("text_post"):
-        return False
-
-    cover_post = previous.get("cover_post")
-    if not cover_post:
-        return False
-
-    if previous.get("sheet_row") or cover_post.get("_editorial_sheet_row"):
-        return False
-
-    if not _is_trusted_editorial_sender(cover_post):
-        return False
-
-    if not (_post_has_cover_source(cover_post) or cover_post.get("_editorial_cover_url")):
-        return False
-
-    try:
-        cover_mid = int(cover_post.get("message_id") or 0)
-        text_mid = int(incoming_text_post.get("message_id") or 0)
-    except Exception:
-        return False
-
-    if cover_mid <= 0 or text_mid != cover_mid + 1:
-        return False
-
-    try:
-        age_sec = float(now_value) - float(previous.get("updated_at") or now_value)
-    except Exception:
-        return False
-
-    return 0 <= age_sec <= 90
-
-
-
-def assemble_editorial_draft_post(post: dict) -> Optional[dict]:
-    """Pair only the text and cover that belong to the same review."""
-    if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
-        return post
-
-    genre = get_genre_from_thread(get_thread_id(post))
-    if genre == "underground" or genre not in TARGET_CHANNELS:
-        return post
-
-    if infer_post_type(get_post_text(post)) == "digest":
-        return post
-
-    key = _draft_parts_key(post)
-    now_value = now_ts()
-    row_number = post.get("_editorial_sheet_row")
-    incoming_text = _is_trusted_editorial_sender(post) and _has_meaningful_publish_text(post)
-    incoming_cover = bool(_post_has_cover_source(post) or post.get("_editorial_cover_url"))
-
-    # Best case: the review and cover arrived together. Never mix it with topic cache.
-    if incoming_text and incoming_cover:
-        direct = dict(post)
-        direct["_editorial_source_message_id"] = post.get("message_id")
-        direct["_editorial_draft_key"] = f"{key}:direct:{post.get('message_id')}:{row_number or ''}"
-        with editorial_draft_parts_lock:
-            editorial_draft_parts[key] = {
-                "updated_at": now_value,
-                "text_post": post,
-                "cover_post": post,
-                "sheet_row": row_number,
-            }
-        print("EDITORIAL DRAFT EXACT MESSAGE:", {"key": key, "row": row_number, "message_id": post.get("message_id")}, flush=True)
-        return direct
-
-    # STRICT REVIEW PAIRING:
-    # Never pair parts merely because they are close in time/message_id.
-    # The old "cover-first within 3 messages / 5 minutes" heuristic could reuse
-    # the previous review's cover for the next review, producing a wrong draft
-    # first and the correct draft only after the real new cover arrived.
-    #
-    # Sheet row is the review identity. If rows differ, cached parts are discarded.
-    with editorial_draft_parts_lock:
-        _prune_editorial_draft_parts(now_value)
-
-        previous = editorial_draft_parts.get(key) or {}
-        previous_row = previous.get("sheet_row")
-
-        row_mismatch = bool(
-            row_number
-            and previous_row
-            and str(row_number) != str(previous_row)
-        )
-
-        if row_mismatch:
-            print(
-                "EDITORIAL CACHE RESET ROW MISMATCH:",
-                {
-                    "key": key,
-                    "cached_row": previous_row,
-                    "incoming_row": row_number,
-                    "message_id": post.get("message_id"),
-                    "incoming_text": incoming_text,
-                    "incoming_cover": incoming_cover,
-                },
-                flush=True,
-            )
-            previous = {}
-            editorial_draft_parts.pop(key, None)
-
-        if incoming_text:
-            # A new text message starts/refreshes the review identity.
-            # Preserve a cached cover ONLY when it is explicitly tied to the
-            # exact same sheet row. Never carry a cover from an unknown/old row.
-            entry = {
-                "updated_at": now_value,
-                "text_post": post,
-                "sheet_row": row_number,
-            }
-
-            previous_cover = previous.get("cover_post")
-            previous_cover_row = (
-                (previous_cover or {}).get("_editorial_sheet_row")
-                or previous.get("sheet_row")
-            )
-
-            if (
-                previous_cover
-                and row_number
-                and previous_cover_row
-                and str(row_number) == str(previous_cover_row)
-            ):
-                entry["cover_post"] = previous_cover
-                print(
-                    "EDITORIAL SAME-ROW COVER REUSED:",
-                    {
-                        "key": key,
-                        "row": row_number,
-                        "cover_message_id": previous_cover.get("message_id"),
-                        "text_message_id": post.get("message_id"),
-                    },
-                    flush=True,
-                )
-
-            elif _can_adopt_unclaimed_cover_first(
-                previous,
-                post,
-                row_number,
-                now_value,
-            ):
-                # The exact cover-first case used by Главред:
-                # cover 4936 -> text 4937 -> new row 359, for example.
-                adopted_cover = dict(previous_cover)
-                adopted_cover["_editorial_sheet_row"] = row_number
-                entry["cover_post"] = adopted_cover
-                print(
-                    "EDITORIAL COVER-FIRST ADOPTED:",
-                    {
-                        "key": key,
-                        "row": row_number,
-                        "cover_message_id": adopted_cover.get("message_id"),
-                        "text_message_id": post.get("message_id"),
-                    },
-                    flush=True,
-                )
-
-            editorial_draft_parts[key] = entry
-        else:
-            entry = editorial_draft_parts.setdefault(
-                key,
-                {
-                    "updated_at": now_value,
-                    "sheet_row": row_number,
-                },
-            )
-
-            # If this is a cover tied to a row, never leave stale text from
-            # another/unknown review in the entry.
-            if incoming_cover and row_number:
-                entry_row = entry.get("sheet_row")
-                if entry_row and str(entry_row) != str(row_number):
-                    entry = {
-                        "updated_at": now_value,
-                        "sheet_row": row_number,
-                    }
-                    editorial_draft_parts[key] = entry
-
-        replied = post.get("reply_to_message") or {}
-        if replied and _is_trusted_editorial_sender(replied) and _has_meaningful_publish_text(replied):
-            replied_row = replied.get("_editorial_sheet_row")
-            if not row_number or not replied_row or str(row_number) == str(replied_row):
-                entry["text_post"] = replied
-
-        if incoming_cover:
-            # Cover is safe to cache only under its own resolved row identity.
-            entry["cover_post"] = post
-
-        if row_number:
-            entry["sheet_row"] = row_number
-
-        entry["updated_at"] = now_value
-
-        text_post = entry.get("text_post")
-        cover_post = entry.get("cover_post")
-        cached_row = entry.get("sheet_row")
-
-    row_number = row_number or cached_row
-
-    # Sheets remains authoritative for WHICH row/cover belongs to the review,
-    # but it must not overwrite a live Telegram text message that already has
-    # the original entities. Hidden text_link entities are where VK/Telegram
-    # hyperlinks and source formatting live; Sheets stores only plain text.
-    if row_number:
-        recovered_text, recovered_cover = _recover_draft_parts_from_sheet(row_number, post)
-
-        if recovered_text:
-            if not text_post:
-                text_post = recovered_text
-            else:
-                live_text = get_post_text(text_post).strip()
-                sheet_text = get_post_text(recovered_text).strip()
-                live_entities = (
-                    text_post.get("entities")
-                    or text_post.get("caption_entities")
-                    or []
-                )
-
-                # Same review text + live Telegram entities -> keep live object.
-                # If text differs, prefer the authoritative sheet row.
-                # If there are no live entities, recovery is still useful because
-                # it rebuilds the Yandex/Common text links synthetically.
-                if live_text != sheet_text or not live_entities:
-                    text_post = recovered_text
-
-        # Keep the incoming cover itself when present; otherwise use Sheets copy.
-        if not incoming_cover and recovered_cover:
-            cover_post = recovered_cover
-        elif incoming_cover:
-            cover_post = post
-
-        with editorial_draft_parts_lock:
-            entry = editorial_draft_parts.setdefault(key, {"updated_at": now_ts()})
-            if text_post:
-                entry["text_post"] = text_post
-            if cover_post:
-                entry["cover_post"] = cover_post
-            entry["sheet_row"] = row_number
-            entry["updated_at"] = now_ts()
-
-    print(
-        "EDITORIAL DRAFT PAIR:",
-        {
-            "key": key,
-            "genre": genre,
-            "incoming_message_id": post.get("message_id"),
-            "sheet_row": row_number,
-            "incoming_text": incoming_text,
-            "incoming_cover": incoming_cover,
-            "text_message_id": (text_post or {}).get("message_id"),
-            "cover_message_id": (cover_post or {}).get("message_id"),
-        },
-        flush=True,
-    )
-
-    if not text_post or not cover_post:
-        print(
-            "EDITORIAL DRAFT WAITING FOR PART:",
-            {"key": key, "genre": genre, "sheet_row": row_number, "has_text": bool(text_post), "has_cover": bool(cover_post)},
-            flush=True,
-        )
-        return None
-
-    # Last safety gate: if both parts carry sheet-row identity, they MUST match.
-    text_row = text_post.get("_editorial_sheet_row") or row_number
-    cover_row = cover_post.get("_editorial_sheet_row") or row_number
-    if text_row and cover_row and str(text_row) != str(cover_row):
-        print(
-            "EDITORIAL DRAFT BLOCKED ROW MISMATCH:",
-            {
-                "key": key,
-                "text_row": text_row,
-                "cover_row": cover_row,
-                "text_message_id": text_post.get("message_id"),
-                "cover_message_id": cover_post.get("message_id"),
-            },
-            flush=True,
-        )
-        return None
-
-    combined = dict(cover_post)
-    combined["chat"] = post.get("chat") or cover_post.get("chat") or text_post.get("chat") or {}
-    combined["message_thread_id"] = get_thread_id(post) or get_thread_id(cover_post) or get_thread_id(text_post)
-    combined["from"] = text_post.get("from") or cover_post.get("from") or {}
-
-    if text_post.get("text") is not None:
-        combined["text"] = text_post.get("text") or ""
-        combined["entities"] = text_post.get("entities") or []
-        combined.pop("caption", None)
-        combined.pop("caption_entities", None)
-    else:
-        combined["caption"] = text_post.get("caption") or ""
-        combined["caption_entities"] = text_post.get("caption_entities") or []
-        combined.pop("text", None)
-        combined.pop("entities", None)
-
-    cover_url = extract_cover_download_url(cover_post) or str(cover_post.get("_editorial_cover_url") or "")
-    if cover_url:
-        combined["_editorial_cover_url"] = cover_url
-
-    text_mid = text_post.get("message_id") or ""
-    cover_mid = cover_post.get("message_id") or ""
-    combined["_editorial_source_message_id"] = text_mid
-    combined["_editorial_sheet_row"] = row_number or text_post.get("_editorial_sheet_row") or cover_post.get("_editorial_sheet_row")
-    combined["_editorial_draft_key"] = f"{key}:{text_mid}:{cover_mid}:{combined.get('_editorial_sheet_row') or ''}"
-    return combined
-
-def _is_cover_service_only_message(post: dict) -> bool:
-    if not _post_has_cover_source(post):
-        return False
-    text = get_post_text(post)
-    if not text:
-        return True
-    try:
-        cleaned = _clean_publish_lines(text)
-        meaningful = [str(item.get("text") or "").strip() for item in cleaned if str(item.get("text") or "").strip()]
-        return not any(not value.startswith("#") for value in meaningful)
-    except Exception:
-        low = text.casefold()
-        return "скачать облож" in low and len(text.strip()) < 250
-
-
-def attach_cover_to_recent_sheet_row(post: dict) -> bool:
-    """Attach a standalone cover to the exact current review whenever possible."""
-    if not _is_cover_service_only_message(post):
-        return False
-    cover_file_id = extract_image_file_id(post) or ""
-    cover_url = extract_cover_download_url(post) or ""
-    if not cover_file_id and not cover_url:
-        return False
-
-    key = _draft_parts_key(post)
-    preferred_row = None
-    with editorial_draft_parts_lock:
-        entry = editorial_draft_parts.get(key) or {}
-        preferred_row = entry.get("sheet_row")
-
-    reply_to_message_id = (post.get("reply_to_message") or {}).get("message_id") or ""
-
-    try:
-        resp = requests.post(
-            WEBHOOK_URL,
-            json={
-                "action": "attach_cover_to_recent",
-                "sheet": PREDLOZHKA_SHEET_NAME,
-                "chat_id": str(get_chat_id(post) or ""),
-                "thread_id": str(get_thread_id(post) or ""),
-                "cover_file_id": cover_file_id,
-                "cover_url": cover_url,
-                "cover_message_id": str(post.get("message_id") or ""),
-                "preferred_row": str(preferred_row or ""),
-                "reply_to_message_id": str(reply_to_message_id or ""),
-            },
-            timeout=60,
-        )
-        print("PREDLOZHKA COVER ATTACH:", resp.status_code, resp.text[:300], flush=True)
-        try:
-            data = resp.json()
-            if data.get("status") == "ok" and data.get("row"):
-                post["_editorial_sheet_row"] = int(data.get("row"))
-                print(
-                    "EDITORIAL COVER ROW LINKED:",
-                    {
-                        "row": data.get("row"),
-                        "message_id": post.get("message_id"),
-                        "match": data.get("match"),
-                    },
-                    flush=True,
-                )
-            else:
-                print("PREDLOZHKA COVER ATTACH NOT FOUND:", data, flush=True)
-        except Exception as parse_error:
-            print("PREDLOZHKA COVER ATTACH PARSE ERROR:", str(parse_error), flush=True)
-        return True
-    except Exception as e:
-        print("PREDLOZHKA COVER ATTACH ERROR:", str(e), flush=True)
-        return True
-
-def should_build_publish_preview(post: dict) -> bool:
-    if not post:
-        return False
-    if not AUTOPUBLISH_PREVIEW_ENABLED:
-        return False
-    if not is_allowed_predlozhka_chat(post) or not is_allowed_predlozhka_thread(post):
-        return False
-
-    if not is_trusted_predlozhka_sender(post):
-        return False
-
-    genre = get_genre_from_thread(get_thread_id(post))
-    if genre == "underground" or genre not in TARGET_CHANNELS:
-        return False
-
-    if infer_post_type(get_post_text(post)) == "digest":
-        return False
-
-    if not extract_image_file_id(post) and not (extract_cover_download_url(post) or post.get("_editorial_cover_url")):
-        return False
-
-    message_id = post.get("message_id")
-    if not message_id:
-        return False
-
-    key = str(post.get("_editorial_draft_key") or f"{get_chat_id(post)}:{message_id}")
-    cutoff = now_ts() - PROCESSED_TTL_SEC
-    for old_key in [k for k, ts in preview_dedup.items() if ts < cutoff]:
-        preview_dedup.pop(old_key, None)
-    if key in preview_dedup:
-        return False
-    preview_dedup[key] = now_ts()
-    return True
-
-
-def _schedule_result_cleanup(result: Optional[dict]):
-    if not result:
-        return
-    chat_id = (result.get("chat") or {}).get("id")
-    message_id = result.get("message_id")
-    if chat_id and message_id:
-        schedule_bot_message_cleanup(chat_id, message_id)
-
-
-def _send_draft_photo(chat_id, thread_id, prepared_path: str, html_text: str, genre: str, row_number=None):
-    plain_length = len(_strip_html_for_length(html_text))
-    buttons = build_draft_buttons(genre, html_text, row_number)
-    if plain_length <= 950:
-        data = {
-            "chat_id": str(chat_id),
-            "caption": html_text,
-            "parse_mode": "HTML",
-            "reply_markup": json.dumps(buttons, ensure_ascii=False),
-        }
-        if thread_id:
-            data["message_thread_id"] = str(thread_id)
-        with open(prepared_path, "rb") as photo:
-            result = telegram_api_multipart("sendPhoto", data, {"photo": ("ready_post.png", photo, "image/png")})
-        _schedule_result_cleanup(result)
-        return result
-
-    photo_data = {"chat_id": str(chat_id)}
-    if thread_id:
-        photo_data["message_thread_id"] = str(thread_id)
-    with open(prepared_path, "rb") as photo:
-        photo_result = telegram_api_multipart("sendPhoto", photo_data, {"photo": ("ready_post.png", photo, "image/png")})
-    _schedule_result_cleanup(photo_result)
-
-    text_payload = {
-        "chat_id": chat_id,
-        "text": html_text,
-        "parse_mode": "HTML",
-        "reply_to_message_id": photo_result.get("message_id"),
-        "allow_sending_without_reply": True,
-        "disable_web_page_preview": True,
-        "reply_markup": buttons,
-    }
-    if thread_id:
-        text_payload["message_thread_id"] = thread_id
-    text_result = telegram_api_json("sendMessage", text_payload)
-    _schedule_result_cleanup(text_result)
-    return text_result
-
-def send_publish_preview(post: dict):
-    genre = get_genre_from_thread(get_thread_id(post))
-    image_file_id = extract_image_file_id(post)
-    cover_url = extract_cover_download_url(post) or str(post.get("_editorial_cover_url") or "")
-    print(
-        "EDITORIAL PREVIEW START:",
-        {
-            "genre": genre,
-            "message_id": post.get("message_id"),
-            "source_message_id": post.get("_editorial_source_message_id"),
-            "sheet_row": post.get("_editorial_sheet_row"),
-            "has_file_id": bool(image_file_id),
-            "has_cover_url": bool(cover_url),
-            "text_len": len(get_post_text(post)),
-        },
-        flush=True,
-    )
-    if not genre or (not image_file_id and not cover_url):
-        print("EDITORIAL PREVIEW SKIP: missing genre/cover", flush=True)
-        return
-
-    source_path = ""
-    prepared_path = ""
-    try:
-        if image_file_id:
-            source_path = tg_download_file(image_file_id)
-        else:
-            print("DRAFT COVER DOWNLOAD:", {"genre": genre, "url": cover_url}, flush=True)
-            source_path = download_cover_from_url(cover_url)
-        prepared_path = prepare_framed_cover(source_path, genre)
-        caption = build_publish_caption(post, genre)
-        if not _strip_html_for_length(caption).strip():
-            print(
-                "EDITORIAL DRAFT WAITING FOR TEXT:",
-                {"genre": genre, "cover_message_id": post.get("message_id"), "source_message_id": post.get("_editorial_source_message_id")},
-                flush=True,
-            )
-            return
-        result = _send_draft_photo(get_chat_id(post), get_thread_id(post), prepared_path, caption, genre, post.get("_editorial_sheet_row"))
-        print(
-            "EDITORIAL DRAFT SENT:",
-            {"genre": genre, "draft_message_id": result.get("message_id"), "source_message_id": post.get("message_id")},
-            flush=True,
-        )
-    finally:
-        for path in (source_path, prepared_path):
-            if path:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-
-
-
-def _utf16_length(value: str) -> int:
-    return len((value or "").encode("utf-16-le")) // 2
-
-
-def ensure_author_custom_emoji_entity(caption: str, entities: List[dict]) -> List[dict]:
-    """Force the configured author emoji to remain a Telegram custom emoji on publish."""
-    result = [dict(item) for item in (entities or []) if isinstance(item, dict)]
-
-    for author, config in AUTHOR_EMOJI_MAP.items():
-        emoji_id = str(config.get("emoji_id") or "").strip()
-        visible = str(config.get("visible") or "🙂")
-        if not emoji_id or not visible:
-            continue
-
-        # We place the emoji before the word "Автор". Find that exact rendered line.
-        patterns = [
-            f"{visible} Автор: {author}",
-            f"{visible} Автор — {author}",
-            f"{visible} Автор - {author}",
-        ]
-        start_index = -1
-        for pattern in patterns:
-            start_index = caption.find(pattern)
-            if start_index >= 0:
-                break
-
-        # Fallback: find the visible emoji immediately before any Автор line.
-        if start_index < 0:
-            match = re.search(re.escape(visible) + r"\s+Автор\s*[:\-–—]", caption, flags=re.IGNORECASE)
-            if match:
-                start_index = match.start()
-
-        if start_index < 0:
-            continue
-
-        offset = _utf16_length(caption[:start_index])
-        length = _utf16_length(visible)
-
-        # Remove a stale/duplicate entity at the same position, then add the correct ID.
-        result = [
-            item for item in result
-            if not (
-                item.get("type") == "custom_emoji"
-                and int(item.get("offset", -1)) == offset
-                and int(item.get("length", -1)) == length
-            )
-        ]
-        result.append({
-            "type": "custom_emoji",
-            "offset": offset,
-            "length": length,
-            "custom_emoji_id": emoji_id,
-        })
-
-    result.sort(key=lambda item: (int(item.get("offset", 0)), -int(item.get("length", 0))))
-    return result
-
-
-def extract_preview_payload(message: dict) -> dict:
-    """Extract photo/caption/entities from the preview message for exact re-sending."""
-    photos = message.get("photo") or []
-    photo_file_id = photos[-1].get("file_id") if photos else ""
-    caption = message.get("caption") or ""
-    entities = ensure_author_custom_emoji_entity(caption, message.get("caption_entities") or [])
-    return {
-        "photo_file_id": photo_file_id,
-        "caption": caption,
-        "caption_entities": entities,
-    }
-
-
-def publish_preview_payload(preview: dict, genre: str) -> dict:
-    """Legacy publisher. Disabled while editorial auto-posting is paused."""
-    if not AUTOPUBLISH_CHANNEL_ENABLED:
-        raise RuntimeError("Автопубликация в каналы временно отключена")
-    target = TARGET_CHANNELS.get(genre)
-    if not target:
-        raise RuntimeError(f"Target channel is not configured for genre={genre}")
-
-    photo_file_id = preview.get("photo_file_id") or ""
-    if not photo_file_id:
-        raise RuntimeError("Preview photo file_id is missing")
-
-    caption = preview.get("caption") or ""
-    caption_entities = ensure_author_custom_emoji_entity(
-        caption,
-        preview.get("caption_entities") or [],
-    )
-    payload = {
-        "chat_id": target,
-        "photo": photo_file_id,
-        "caption": caption,
-        "caption_entities": caption_entities,
-    }
-    return telegram_api_json("sendPhoto", payload)
-
-
-def load_scheduled_posts() -> List[dict]:
-    with scheduled_posts_lock:
-        try:
-            if not os.path.isfile(AUTOPUBLISH_STORE_PATH):
-                return []
-            with open(AUTOPUBLISH_STORE_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            print("SCHEDULE LOAD ERROR:", str(e), flush=True)
-            return []
-
-
-def save_scheduled_posts(items: List[dict]):
-    with scheduled_posts_lock:
-        directory = os.path.dirname(os.path.abspath(AUTOPUBLISH_STORE_PATH))
-        os.makedirs(directory, exist_ok=True)
-        tmp_path = AUTOPUBLISH_STORE_PATH + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(items, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, AUTOPUBLISH_STORE_PATH)
-
-
-def parse_schedule_time(value: str):
-    raw = (value or "").strip().lower().replace("ё", "е")
-    tz = get_autopublish_tz()
-    now = datetime.now(tz)
-
-    match = re.fullmatch(r"(сегодня|завтра)\s+(\d{1,2}):(\d{2})", raw)
-    if match:
-        day_word, hour, minute = match.groups()
-        dt = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if day_word == "завтра":
-            dt += timedelta(days=1)
-        if day_word == "сегодня" and dt <= now:
-            raise ValueError("Время сегодня уже прошло")
-        return dt
-
-    for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M"):
-        try:
-            parsed = datetime.strptime(raw, fmt)
-            if fmt == "%d.%m %H:%M":
-                parsed = parsed.replace(year=now.year)
-                if parsed.replace(tzinfo=tz) <= now:
-                    parsed = parsed.replace(year=now.year + 1)
-            dt = parsed.replace(tzinfo=tz)
-            if dt <= now:
-                raise ValueError("Указанное время уже прошло")
-            return dt
-        except ValueError as e:
-            if str(e) in ("Указанное время уже прошло",):
-                raise
-            continue
-    raise ValueError("Не понял время. Пример: сегодня 18:30, завтра 12:00 или 06.08.2026 14:00")
-
-
-def handle_publish_callback(callback: dict) -> bool:
-    data = callback.get("data") or ""
-    if not data.startswith(("pub_now:", "pub_later:", "pub_cancel:")):
-        return False
-    callback_id = callback.get("id")
-    telegram_api("answerCallbackQuery", {
-        "callback_query_id": callback_id,
-        "text": "Автопубликация временно отключена. Создай новый предпросмотр.",
-        "show_alert": True,
-    })
-    return True
-
-
-def _legacy_handle_publish_callback_disabled(callback: dict) -> bool:
-    data = callback.get("data") or ""
-    if not data.startswith(("pub_now:", "pub_later:", "pub_cancel:")):
-        return False
-
-    callback_id = callback.get("id")
-    user = callback.get("from") or {}
-    user_id = user.get("id")
-    message = callback.get("message") or {}
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    message_id = message.get("message_id")
-    thread_id = message.get("message_thread_id")
-    genre = data.split(":", 1)[1]
-
-    if data.startswith("pub_now:"):
-        result = publish_preview_payload(extract_preview_payload(message), genre)
-        telegram_api("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": "Опубликовано",
-            "show_alert": False,
-        })
-        confirmation = {
-            "chat_id": chat_id,
-            "text": f"✅ Пост опубликован в {TARGET_CHANNELS.get(genre)}. Message ID: {result.get('message_id')}",
-        }
-        if thread_id:
-            confirmation["message_thread_id"] = thread_id
-        telegram_api_json("sendMessage", confirmation)
-        return True
-
-    if data.startswith("pub_later:"):
-        awaiting_schedule[str(user_id)] = {
-            "chat_id": chat_id,
-            "thread_id": thread_id,
-            "preview_message_id": message_id,
-            "genre": genre,
-            "preview": extract_preview_payload(message),
-            "created_at": now_ts(),
-        }
-        telegram_api("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": "Напиши время следующим сообщением",
-            "show_alert": False,
-        })
-        prompt = {
-            "chat_id": chat_id,
-            "text": "🕒 На когда поставить публикацию?\n\nПримеры:\nсегодня 18:30\nзавтра 12:00\n06.08.2026 14:00",
-        }
-        if thread_id:
-            prompt["message_thread_id"] = thread_id
-        telegram_api_json("sendMessage", prompt)
-        return True
-
-    telegram_api("answerCallbackQuery", {
-        "callback_query_id": callback_id,
-        "text": "Предпросмотр отменён",
-        "show_alert": False,
-    })
-    try:
-        telegram_api_json("editMessageReplyMarkup", {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "reply_markup": {"inline_keyboard": []},
-        })
-    except Exception:
-        pass
-    return True
-
-
-def handle_schedule_time_message(post: dict) -> bool:
-    user_id = str((post.get("from") or {}).get("id") or "")
-    state = awaiting_schedule.get(user_id)
-    if not state:
-        return False
-    if get_chat_id(post) != state.get("chat_id") or get_thread_id(post) != state.get("thread_id"):
-        return False
-
-    text = get_post_text(post)
-    try:
-        scheduled_at = parse_schedule_time(text)
-    except ValueError as e:
-        payload = {"chat_id": get_chat_id(post), "text": f"❗ {e}"}
-        if get_thread_id(post):
-            payload["message_thread_id"] = get_thread_id(post)
-        telegram_api_json("sendMessage", payload)
-        return True
-
-    job = {
-        "id": f"{state['chat_id']}:{state['preview_message_id']}:{int(scheduled_at.timestamp())}",
-        "source_chat_id": state["chat_id"],
-        "source_message_id": state["preview_message_id"],
-        "preview": state.get("preview") or {},
-        "thread_id": state.get("thread_id"),
-        "genre": state["genre"],
-        "target_channel": TARGET_CHANNELS.get(state["genre"], ""),
-        "scheduled_at": scheduled_at.isoformat(),
-        "requested_by": user_id,
-        "status": "scheduled",
-    }
-
-    save_result = sheets_post_action("add_scheduled_post", {
-        "job": job,
-    })
-    if save_result.get("error"):
-        raise RuntimeError(save_result.get("error"))
-
-    awaiting_schedule.pop(user_id, None)
-
-    payload = {
-        "chat_id": get_chat_id(post),
-        "text": f"✅ Поставил публикацию на {scheduled_at.strftime('%d.%m.%Y %H:%M')} ({AUTOPUBLISH_TIMEZONE}).",
-    }
-    if get_thread_id(post):
-        payload["message_thread_id"] = get_thread_id(post)
-    telegram_api_json("sendMessage", payload)
-    return True
-
-
-def run_scheduled_posts_once():
-    if not AUTOPUBLISH_PREVIEW_ENABLED:
-        return
-
-    try:
-        response = sheets_get("get_due_scheduled_posts", {"limit": "20"})
-    except Exception as e:
-        print("SCHEDULE GET DUE ERROR:", str(e), flush=True)
-        return
-
-    jobs = response.get("jobs") or []
-    if not jobs:
-        return
-
-    now = datetime.now(get_autopublish_tz())
-
-    for job in jobs:
-        job_id = str(job.get("id") or "")
-        try:
-            preview = job.get("preview") or {}
-            if not preview:
-                raise RuntimeError("Scheduled post has no saved preview payload; recreate the schedule")
-
-            result = publish_preview_payload(preview, job.get("genre") or "")
-            published_message_id = result.get("message_id")
-            published_link = ""
-            target = job.get("target_channel") or TARGET_CHANNELS.get(job.get("genre") or "", "")
-            if target and published_message_id:
-                published_link = f"https://t.me/{str(target).lstrip('@')}/{published_message_id}"
-
-            mark_result = sheets_post_action("mark_scheduled_post_published", {
-                "id": job_id,
-                "published_message_id": published_message_id or "",
-                "published_at": now.isoformat(),
-                "published_link": published_link,
-            })
-            if mark_result.get("error"):
-                raise RuntimeError(mark_result.get("error"))
-
-            confirmation = {
-                "chat_id": job.get("source_chat_id"),
-                "text": f"✅ Отложенный пост опубликован в {target}.",
-            }
-            if job.get("thread_id"):
-                confirmation["message_thread_id"] = job.get("thread_id")
-            if confirmation.get("chat_id"):
-                telegram_api_json("sendMessage", confirmation)
-
-        except Exception as e:
-            error_text = str(e)
-            try:
-                sheets_post_action("mark_scheduled_post_error", {
-                    "id": job_id,
-                    "error": error_text,
-                    "failed_at": now.isoformat(),
-                })
-            except Exception as mark_error:
-                print("SCHEDULE MARK ERROR FAILED:", str(mark_error), flush=True)
-            print("SCHEDULED PUBLISH ERROR:", {"job": job, "error": error_text}, flush=True)
-
-
-def autopublish_scheduler_loop():
-    print("AUTOPUBLISH SCHEDULER STARTED", {"interval_sec": AUTOPUBLISH_CHECK_INTERVAL_SEC}, flush=True)
-    time.sleep(10)
-    while True:
-        try:
-            run_scheduled_posts_once()
-        except Exception as e:
-            print("AUTOPUBLISH SCHEDULER ERROR:", str(e), flush=True)
-        time.sleep(AUTOPUBLISH_CHECK_INTERVAL_SEC)
-
-
-def start_autopublish_scheduler():
-    global autopublish_scheduler_started
-    if not AUTOPUBLISH_PREVIEW_ENABLED:
-        print("AUTOPUBLISH PREVIEW DISABLED: set AUTOPUBLISH_PREVIEW_ENABLED=1", flush=True)
-        return
-    with autopublish_scheduler_lock:
-        if autopublish_scheduler_started:
-            return
-        thread = threading.Thread(target=autopublish_scheduler_loop, daemon=True)
-        thread.start()
-        autopublish_scheduler_started = True
-
-
-# ======================
-# EDITORIAL DRAFT BUTTONS / PENDING LIST / CLEANUP
-# ======================
-def _message_text_and_entities(message: dict):
-    if message.get("text") is not None:
-        return message.get("text") or "", message.get("entities") or []
-    return message.get("caption") or "", message.get("caption_entities") or []
-
-
-def _draft_photo_message(message: dict) -> dict:
-    if message.get("photo"):
-        return message
-    replied = message.get("reply_to_message") or {}
-    if replied.get("photo"):
-        return replied
-    return {}
-
-
-def handle_draft_callback(callback: dict) -> bool:
-    data = callback.get("data") or ""
-    if data == "draft_copy":
-        # Compatibility for old draft messages created before V12.
-        telegram_api("answerCallbackQuery", {
-            "callback_query_id": callback.get("id"),
-            "text": "Кнопка копирования отключена",
-            "show_alert": False,
-        })
-        return True
-    if data != "draft_cover":
-        return False
-
-    callback_id = callback.get("id")
-    message = callback.get("message") or {}
-    chat_id = (message.get("chat") or {}).get("id")
-    thread_id = message.get("message_thread_id")
-
-    photo_message = _draft_photo_message(message)
-    photos = photo_message.get("photo") or []
-    if not photos:
-        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Не нашёл готовую обложку", "show_alert": True})
-        return True
-
-    source_path = ""
-    png_path = ""
-    try:
-        source_path = tg_download_file(photos[-1].get("file_id"))
-        with Image.open(source_path) as image:
-            ready = image.convert("RGB")
-            if ready.size != (1280, 1280):
-                ready = ImageOps.fit(ready, (1280, 1280), method=Image.Resampling.LANCZOS)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            png_path = tmp.name
-            tmp.close()
-            ready.save(png_path, "PNG", optimize=True)
-        data_payload = {"chat_id": str(chat_id)}
-        if thread_id:
-            data_payload["message_thread_id"] = str(thread_id)
-        with open(png_path, "rb") as doc:
-            result = telegram_api_multipart("sendDocument", data_payload, {"document": ("cover_1280.png", doc, "image/png")})
-        _schedule_result_cleanup(result)
-        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Готовая обложка отправлена файлом", "show_alert": False})
-    finally:
-        for path in (source_path, png_path):
-            if path:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-    return True
-
-
-def _pending_title(raw_text: str) -> str:
-    """
-    Show a useful pending-list title: prefer the real "Artist — Track" line
-    instead of a teaser/quote or the generic "Публикация".
-    """
-    raw_text = raw_text or ""
-
-    try:
-        cleaned = _clean_publish_lines(raw_text)
-        candidates = [
-            str(item.get("text") or "").strip()
-            for item in cleaned
-            if str(item.get("text") or "").strip()
-        ]
-    except Exception:
-        candidates = [line.strip() for line in raw_text.splitlines() if line.strip()]
-
-    # First choice: an explicit release title like "Юля Шаврина - Сожги этот дом".
-    for line in candidates:
-        if _looks_like_release_title(line):
-            return re.sub(r"^💿\s*", "", line).strip()[:180]
-
-    # Fallback: use the first meaningful non-service line.
-    for line in candidates:
-        low = line.casefold()
-        if low.startswith("#"):
-            continue
-        if low.startswith("@"):
-            continue
-        if re.match(r"^автор\s*[:\-–—]", line, flags=re.IGNORECASE):
-            continue
-        if "скачать облож" in low or "удалить перед публикацией" in low:
-            continue
-        return re.sub(r"^💿\s*", "", line).strip()[:180]
-
-    return "Публикация"
-
-
-def build_pending_reviews_text(items: List[dict], requested_genre: str = "") -> str:
-    if not items:
-        suffix = f" жанра {genre_label(requested_genre)}" if requested_genre and requested_genre != "all" else ""
-        return f"✅ Невышедших постов{suffix} сейчас нет."
-    grouped = {}
-    for item in items:
-        genre = (item.get("genre") or item.get("channel") or "other").strip() or "other"
-        grouped.setdefault(genre, []).append(item)
-    parts = ["📚 <b>Невышедшие посты</b>", ""]
-    ordered = ["glavred", "rock", "indie", "folk", "pop", "hiphop", "electronica", "underground"]
-    keys = [g for g in ordered if g in grouped] + [g for g in grouped if g not in ordered]
-    for genre in keys:
-        parts.append(f"<b>{html_escape(genre_label(genre))} — {len(grouped[genre])}</b>")
-        for item in grouped[genre]:
-            display_title = str(item.get("display_title") or "").strip()
-            if display_title and display_title.casefold() != "публикация":
-                title = html_escape(display_title)
-            else:
-                title = html_escape(_pending_title(item.get("title") or ""))
-            link = item.get("link") or item.get("common_link") or item.get("yandex_link") or ""
-            age = str(item.get("age_display") or "").strip()
-            age_suffix = f" — ⏱ {html_escape(age)}" if age else ""
-            parts.append(f'• <a href="{html_escape(first_link(link))}">{title}</a>{age_suffix}' if link else f"• {title}{age_suffix}")
-        parts.append("")
-    value = "\n".join(parts).strip()
-    if len(_strip_html_for_length(value)) <= 3900:
-        return value
-    compact = [parts[0], "", f"Всего: {len(items)}. Список сокращён из-за лимита Telegram.", ""]
-    for line in parts[2:]:
-        compact.append(line)
-        if len(_strip_html_for_length("\n".join(compact))) > 3700:
-            compact.pop()
-            break
-    return "\n".join(compact).strip()
-
-
-def send_pending_reviews(chat_id, thread_id=None, genre: str = "all"):
-    params = {"limit": "200"}
-    if genre and genre != "all":
-        params["genre"] = genre
-    result = sheets_get("get_pending_reviews", params)
-    print(
-        "PENDING REVIEWS RESULT:",
-        {
-            "script_version": result.get("script_version"),
-            "count": result.get("count"),
-            "skipped_terminal": result.get("skipped_terminal"),
-            "source_of_truth": result.get("source_of_truth"),
-            "requested_genre": genre,
-        },
-        flush=True,
-    )
-    payload = {"chat_id": chat_id, "text": build_pending_reviews_text(result.get("items") or [], genre), "parse_mode": "HTML", "disable_web_page_preview": True}
-    if thread_id:
-        payload["message_thread_id"] = thread_id
-    sent = telegram_api_json("sendMessage", payload)
-    _schedule_result_cleanup(sent)
-    return sent
-
-
-def handle_pending_callback(callback: dict) -> bool:
-    data = callback.get("data") or ""
-    if not data.startswith("pending:"):
-        return False
-    genre = data.split(":", 1)[1] or "all"
-    callback_id = callback.get("id")
-    context = callback_message_context(callback)
-    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Собираю список невышедших постов", "show_alert": False})
-    send_pending_reviews(context.get("chat_id"), context.get("thread_id"), genre)
-    return True
-
-
-def handle_editorial_menu_command(post: dict) -> bool:
-    text = get_post_text(post).strip()
-    command = text.split()[0].split("@")[0].lower() if text else ""
-    if command not in ("/menu", "/pending"):
-        return False
-    chat_id = get_chat_id(post)
-    thread_id = get_thread_id(post)
-    if command == "/pending":
-        send_pending_reviews(chat_id, thread_id, get_genre_from_thread(thread_id) or "all")
-        return True
-    payload = {"chat_id": chat_id, "text": "Редакционное меню", "reply_markup": {"inline_keyboard": [[{"text": "📚 Невышедшие посты", "callback_data": "pending:all"}]]}}
-    if thread_id:
-        payload["message_thread_id"] = thread_id
-    result = telegram_api_json("sendMessage", payload)
-    _schedule_result_cleanup(result)
-    return True
-
-
-def schedule_bot_message_cleanup(chat_id, message_id):
-    if not BOT_MESSAGE_CLEANUP_ENABLED or not chat_id or not message_id:
-        return
-    try:
-        delete_at = datetime.now(get_autopublish_tz()) + timedelta(minutes=BOT_MESSAGE_CLEANUP_AFTER_MINUTES)
-        result = sheets_post_action("add_cleanup_task", {"task": {"id": f"{chat_id}:{message_id}", "chat_id": str(chat_id), "message_id": str(message_id), "delete_at": delete_at.isoformat(), "status": "scheduled"}})
-        if result.get("error"):
-            print("CLEANUP QUEUE ERROR:", result, flush=True)
-    except Exception as e:
-        print("CLEANUP QUEUE ERROR:", str(e), flush=True)
-
-
-def run_cleanup_once():
-    if not BOT_MESSAGE_CLEANUP_ENABLED:
-        return
-    try:
-        result = sheets_get("get_due_cleanup_tasks", {"limit": "50"})
-    except Exception as e:
-        print("CLEANUP GET ERROR:", str(e), flush=True)
-        return
-    for task in result.get("tasks") or []:
-        task_id = str(task.get("id") or "")
-        error_text = ""
-        try:
-            telegram_api_json("deleteMessage", {"chat_id": task.get("chat_id"), "message_id": int(task.get("message_id"))})
-        except Exception as e:
-            error_text = str(e)
-            print("CLEANUP DELETE ERROR:", {"task": task, "error": error_text}, flush=True)
-        try:
-            sheets_post_action("mark_cleanup_done", {"id": task_id, "error": error_text})
-        except Exception as e:
-            print("CLEANUP MARK ERROR:", str(e), flush=True)
-
-
-def cleanup_scheduler_loop():
-    print("CLEANUP SCHEDULER STARTED", {"interval_sec": BOT_MESSAGE_CLEANUP_CHECK_SEC}, flush=True)
-    time.sleep(30)
-    while True:
-        run_cleanup_once()
-        time.sleep(BOT_MESSAGE_CLEANUP_CHECK_SEC)
-
-
-def start_cleanup_scheduler():
-    global cleanup_scheduler_started
-    if not BOT_MESSAGE_CLEANUP_ENABLED:
-        return
-    with cleanup_scheduler_lock:
-        if cleanup_scheduler_started:
-            return
-        thread = threading.Thread(target=cleanup_scheduler_loop, daemon=True)
-        thread.start()
-        cleanup_scheduler_started = True
-
-
-# ======================
-# REVIEW ENGINE — SAFE ADDITION
-# ======================
-review_scheduler_started = False
-review_scheduler_lock = threading.Lock()
-
-
-def sheets_get(action: str, params: Optional[dict] = None) -> dict:
-    payload = {"action": action}
-    if params:
-        payload.update(params)
-
-    resp = requests.get(WEBHOOK_URL, params=payload, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def sheets_post_action(action: str, payload: Optional[dict] = None) -> dict:
-    data = {"action": action}
-    if payload:
-        data.update(payload)
-
-    resp = requests.post(WEBHOOK_URL, json=data, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def build_review_buttons(row_number) -> dict:
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "👍 ОБЗОР ЕСТЬ НА КАНАЛЕ",
-                    "callback_data": f"review_done:{row_number}",
-                }
-            ],
-            [
-                {
-                    "text": "👀 ПОКАЗАТЬ ОБЗОР В ГРУППЕ БОТА",
-                    "callback_data": f"review_show:{row_number}",
-                }
-            ],
-        ]
-    }
-
-
-def send_review_reminder(reminder: dict):
-    chat_id = reminder.get("chat_id") or reminder.get("Chat ID")
-    if not chat_id:
-        print("REVIEW REMINDER SKIP: no chat_id", reminder, flush=True)
-        return
-
-    thread_id = reminder.get("thread_id") or reminder.get("Thread ID")
-    source_message_id = reminder.get("message_id") or reminder.get("messageId") or reminder.get("Message ID")
-    row_number = reminder.get("row") or reminder.get("row_number")
-    title = (reminder.get("title") or reminder.get("Title") or "").strip()
-    genre = reminder.get("genre") or reminder.get("Genre") or ""
-    source_link = reminder.get("link") or reminder.get("Link") or ""
-    days_old = reminder.get("days_old") or reminder.get("daysOld") or "14+"
-    yandex_link = reminder.get("yandex_link") or reminder.get("Yandex Link") or ""
-    common_link = reminder.get("common_link") or reminder.get("Common Link") or ""
-
-    text_parts = [
-        "⚠️ Напоминание по обзору",
-        "",
-        f"Обзор из раздела «{genre or 'неизвестно'}» пока не найден в публикациях.",
-        f"Прошло дней: {days_old}",
-        "",
-    ]
-
-    if title:
-        text_parts.append(title[:1200])
-        text_parts.append("")
-
-    if source_link:
-        text_parts.append(f"Исходный пост: {source_link}")
-
-    if yandex_link:
-        text_parts.append(f"Яндекс: {yandex_link}")
-
-    if common_link:
-        text_parts.append(f"Общая ссылка: {common_link}")
-
-    payload = {
-        "chat_id": chat_id,
-        "text": "\n".join(text_parts),
-        "reply_markup": build_review_buttons(row_number),
-        "disable_web_page_preview": True,
-    }
-
-    if thread_id:
-        try:
-            payload["message_thread_id"] = int(thread_id)
-        except Exception:
-            pass
-
-    if source_message_id:
-        try:
-            payload["reply_to_message_id"] = int(source_message_id)
-            payload["allow_sending_without_reply"] = True
-        except Exception:
-            pass
-
-    result = telegram_api_json("sendMessage", payload)
-    _schedule_result_cleanup(result)
-    print("REVIEW REMINDER SENT:", {"row": row_number, "chat_id": chat_id, "thread_id": thread_id}, flush=True)
-
-
-
-def build_telegram_message_link(chat_id, message_id) -> str:
-    if not chat_id or not message_id:
-        return ""
-
-    chat_id_str = str(chat_id)
-    if chat_id_str.startswith("-100"):
-        return f"https://t.me/c/{chat_id_str[4:]}/{message_id}"
-
-    return ""
-
-
-def extract_digest_title(text: str) -> str:
-    """
-    Keeps the digest compact: first meaningful line, without hashtag-only noise.
-    """
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    for line in lines:
-        low = line.lower()
-        if low.startswith("#сверхновые"):
-            continue
-        if low in ("яндекс музыка", "слушать везде"):
-            continue
-        if "яндекс музыка" in low and "слушать" in low and len(line) < 80:
-            continue
-        return line[:180]
-    return "Публикация"
-
-
-GENRE_LABELS = {
-    "rock": "Рок",
-    "indie": "Инди",
-    "electronica": "Электроника",
-    "folk": "Фолк",
-    "pop": "Поп",
-    "underground": "Андеграунд",
-    "hiphop": "Хип-хоп",
-    "glavred": "Главред",
+    "Декабрь"
+  ];
+
+  var unixTime = Number(data.date || 0);
+
+  var month = unixTime
+    ? monthNamesRu[new Date(unixTime * 1000).getMonth()]
+    : (data.month || "");
+
+  var formattedDate = unixTime
+    ? Utilities.formatDate(
+        new Date(unixTime * 1000),
+        Session.getScriptTimeZone(),
+        "yyyy-MM-dd HH:mm:ss"
+      )
+    : "";
+
+  return {
+    month: month,
+    formattedDate: formattedDate
+  };
 }
 
 
-def html_escape(value: str) -> str:
-    return (
-        str(value or "")
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+function detectType(data, sheetName) {
+  var explicitType = String(data.type || "").trim();
+
+  if (explicitType) {
+    return explicitType;
+  }
+
+  if (sheetName !== PREDLOZHKA_SHEET_NAME) {
+    return "";
+  }
+
+  var title = String(data.title || "").toLowerCase();
+
+  if (title.indexOf("#сверхновые") !== -1) {
+    return "digest";
+  }
+
+  return "review";
+}
 
 
-def genre_label(genre: str) -> str:
-    genre_clean = (genre or "").strip()
-    return GENRE_LABELS.get(genre_clean, genre_clean.capitalize() if genre_clean else "жанра")
+function detectStatus(data, sheetName, typeValue) {
+  var explicitStatus = String(data.status || "").trim();
+
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+
+  if (sheetName === PREDLOZHKA_SHEET_NAME) {
+    return "pending";
+  }
+
+  if (typeValue === "published") {
+    return "done";
+  }
+
+  return "";
+}
 
 
-def split_digest_post_text(text: str):
-    """
-    Returns: (artist_song_title, review_text)
+function findDuplicateInfo(sheet, data, formattedDate) {
+  var values = sheet.getDataRange().getValues();
 
-    Expected editorial format:
-    Исполнитель — Название
-    #сверхновые
-    Текст обзора
-    Автор: ...
-    @editor (удалить перед публикацией)
-    скачать обложку
+  var title = data.title || "";
+  var channel = data.channel || "";
+  var link = data.link || "";
+  var mediaGroupId = data.media_group_id || "";
 
-    We keep the actual review text, but remove service/editorial lines:
-    hashtags, mentions, author, cover-download links, and music-link labels.
-    """
-    raw_lines = [line.strip() for line in (text or "").splitlines()]
-    lines = [line for line in raw_lines if line]
+  for (var i = 1; i < values.length; i++) {
+    var existingTitle = values[i][0];
+    var existingChannel = values[i][1];
+    var existingDate = values[i][2];
+    var existingLink = values[i][3];
+    var existingMediaGroupId = values[i][4];
 
-    title = ""
-    body_lines = []
-
-    for line in lines:
-        low = line.lower()
-
-        if low.startswith("#"):
-            continue
-        if low.startswith("@"):
-            continue
-        if low.startswith("автор:") or low.startswith("автор —") or low.startswith("автор -"):
-            continue
-        if low.startswith("яндекс:") or low.startswith("общая ссылка:"):
-            continue
-        if low.startswith("http://") or low.startswith("https://"):
-            continue
-        if "яндекс музыка" in low and ("слушать" in low or "|" in low):
-            continue
-        if "скачать облож" in low or "удалить перед публикацией" in low:
-            continue
-
-        if not title:
-            title = line
-        else:
-            body_lines.append(line)
-
-    if not title:
-        title = extract_digest_title(text)
-
-    review_text = "\n".join(body_lines).strip()
-    return title, review_text
-
-
-def first_link(value: str) -> str:
-    if not value:
-        return ""
-    return str(value).split()[0].strip()
-
-
-def build_digest_text(digest: dict) -> str:
-    genre = digest.get("genre") or digest.get("Genre") or ""
-    items = digest.get("items") or []
-    disc = genre_emoji_html(genre)
-    header_text = f"Дайджест сверхновых жанра {html_escape(genre_label(genre))}"
-    header = f"{disc} {header_text}" if disc else header_text
-    text_parts = [f"<b>{header}</b>", ""]
-    for item in items:
-        raw_text = item.get("title") or item.get("Title") or ""
-        item_title, review_text = split_digest_post_text(raw_text)
-        yandex = first_link(item.get("yandex_link") or item.get("Yandex Link") or "")
-        common = first_link(item.get("common_link") or item.get("Common Link") or "")
-        link_for_title = common or yandex
-        safe_title = html_escape(item_title)
-        text_parts.append(f'<b><a href="{html_escape(link_for_title)}">{safe_title}</a></b>' if link_for_title else f"<b>{safe_title}</b>")
-        if review_text:
-            text_parts.append("")
-            review_lines = [line.strip() for line in review_text.splitlines() if line.strip()]
-            if review_lines:
-                text_parts.append(f"<blockquote>{html_escape(review_lines[0])}</blockquote>")
-                if len(review_lines) > 1:
-                    text_parts.append("")
-                    for line in review_lines[1:]:
-                        text_parts.append(f"{liked_section_emoji_html()} {html_escape(line)}" if _line_is_liked_heading(line) else html_escape(line))
-        text_parts.append("")
-    text_parts.append("#сверхновые")
-    return "\n".join(text_parts).strip()[:3900]
-
-
-def _digest_cover_source(item: dict) -> str:
-    """
-    Pick the cover for one #сверхновые item.
-
-    Prefer Cover URL over Telegram Cover File ID.
-
-    Old rows may still contain a stale/wrong File ID from an earlier attachment
-    match, while the exact "скачать обложку" URL has already been recovered and
-    stored correctly in Google Sheets. If File ID wins, two different releases
-    can accidentally render the same old Telegram image in the collage.
-
-    The recovered Cover URL is tied to the exact source-message row, so it is
-    the safer source whenever it exists. File ID remains a fallback for releases
-    that arrived as a real Telegram photo and have no URL.
-    """
-    row_number = item.get("row") or item.get("Row")
-    file_id = str(item.get("cover_file_id") or item.get("Cover File ID") or "").strip()
-    cover_url = str(item.get("cover_url") or item.get("Cover URL") or "").strip()
-
-    if cover_url:
-        print(
-            "DIGEST COVER SOURCE:",
-            {
-                "row": row_number,
-                "source": "cover_url",
-                "has_file_id": bool(file_id),
-            },
-            flush=True,
-        )
-        return download_cover_from_url(cover_url)
-
-    if file_id:
-        print(
-            "DIGEST COVER SOURCE:",
-            {
-                "row": row_number,
-                "source": "telegram_file_id",
-                "has_cover_url": False,
-            },
-            flush=True,
-        )
-        return tg_download_file(file_id)
-
-    print(
-        "DIGEST COVER SOURCE:",
-        {
-            "row": row_number,
-            "source": "missing",
-        },
-        flush=True,
-    )
-    return ""
-
-
-def recover_digest_cover_from_source_message(
-    item: dict,
-    chat_id,
-    thread_id=None,
-) -> bool:
-    """
-    Recover an OLD #сверхновые cover from its original Telegram message.
-
-    Strategy:
-      1) silently forward the old source message to the same topic;
-      2) inspect the returned Message object;
-      3) recover photo file_id or the hidden "скачать обложку" URL;
-      4) save the recovered cover to the exact Predlozhka row;
-      5) immediately delete the temporary forwarded message.
-
-    Recovery failure never blocks the digest; the collage can still use
-    its placeholder tile.
-    """
-    row_number = item.get("row") or item.get("Row")
-    source_message_id = item.get("message_id") or item.get("Message ID")
-
-    existing_file_id = str(
-        item.get("cover_file_id")
-        or item.get("Cover File ID")
-        or ""
-    ).strip()
-    existing_cover_url = str(
-        item.get("cover_url")
-        or item.get("Cover URL")
-        or ""
-    ).strip()
-
-    if existing_file_id or existing_cover_url:
-        return True
-
-    if not row_number or not chat_id or not source_message_id:
-        print(
-            "DIGEST COVER RECOVERY SKIP:",
-            {
-                "row": row_number,
-                "chat_id": chat_id,
-                "thread_id": thread_id,
-                "message_id": source_message_id,
-                "reason": "missing row/chat/message_id",
-            },
-            flush=True,
-        )
-        return False
-
-    forward_payload = {
-        "chat_id": chat_id,
-        "from_chat_id": chat_id,
-        "message_id": int(source_message_id),
-        "disable_notification": True,
-    }
-    if thread_id:
-        try:
-            forward_payload["message_thread_id"] = int(thread_id)
-        except Exception:
-            forward_payload["message_thread_id"] = thread_id
-
-    forwarded = None
-    try:
-        forwarded = telegram_api_json("forwardMessage", forward_payload)
-
-        recovered_file_id = extract_image_file_id(forwarded) or ""
-        recovered_cover_url = extract_cover_download_url(forwarded) or ""
-
-        if not recovered_file_id and not recovered_cover_url:
-            print(
-                "DIGEST COVER RECOVERY NOT FOUND:",
-                {
-                    "row": row_number,
-                    "source_message_id": source_message_id,
-                    "forwarded_message_id": forwarded.get("message_id"),
-                },
-                flush=True,
-            )
-            return False
-
-        save_result = sheets_post_action(
-            "attach_cover_to_recent",
-            {
-                "sheet": PREDLOZHKA_SHEET_NAME,
-                "chat_id": str(chat_id),
-                "thread_id": str(thread_id or ""),
-                "cover_file_id": recovered_file_id,
-                "cover_url": recovered_cover_url,
-                "preferred_row": str(row_number),
-                "cover_message_id": str(forwarded.get("message_id") or ""),
-                "reply_to_message_id": str(source_message_id),
-            },
-        )
-
-        if save_result.get("status") != "ok":
-            print(
-                "DIGEST COVER RECOVERY SAVE FAILED:",
-                {
-                    "row": row_number,
-                    "source_message_id": source_message_id,
-                    "result": save_result,
-                },
-                flush=True,
-            )
-            return False
-
-        # Use the recovered cover immediately in this same digest run.
-        if recovered_file_id:
-            item["cover_file_id"] = recovered_file_id
-        if recovered_cover_url:
-            item["cover_url"] = recovered_cover_url
-
-        print(
-            "DIGEST COVER RECOVERED:",
-            {
-                "row": row_number,
-                "source_message_id": source_message_id,
-                "forwarded_message_id": forwarded.get("message_id"),
-                "has_file_id": bool(recovered_file_id),
-                "has_cover_url": bool(recovered_cover_url),
-                "save_result": save_result,
-            },
-            flush=True,
-        )
-        return True
-
-    except Exception as e:
-        print(
-            "DIGEST COVER RECOVERY ERROR:",
-            {
-                "row": row_number,
-                "source_message_id": source_message_id,
-                "error": str(e),
-            },
-            flush=True,
-        )
-        return False
-
-    finally:
-        if forwarded and forwarded.get("message_id"):
-            try:
-                telegram_api_json(
-                    "deleteMessage",
-                    {
-                        "chat_id": chat_id,
-                        "message_id": int(forwarded.get("message_id")),
-                    },
-                )
-                print(
-                    "DIGEST COVER RECOVERY TEMP DELETED:",
-                    {
-                        "row": row_number,
-                        "message_id": forwarded.get("message_id"),
-                    },
-                    flush=True,
-                )
-            except Exception as delete_error:
-                print(
-                    "DIGEST COVER RECOVERY TEMP DELETE ERROR:",
-                    {
-                        "row": row_number,
-                        "message_id": forwarded.get("message_id"),
-                        "error": str(delete_error),
-                    },
-                    flush=True,
-                )
-
-
-def recover_missing_digest_covers(digest: dict) -> dict:
-    """
-    Repair missing covers for digest items before collage build.
-    """
-    chat_id = digest.get("chat_id") or digest.get("Chat ID")
-    thread_id = digest.get("thread_id") or digest.get("Thread ID")
-    items = digest.get("items") or []
-
-    attempted = 0
-    recovered = 0
-    still_missing = []
-
-    for item in items:
-        has_cover = bool(
-            str(item.get("cover_file_id") or item.get("Cover File ID") or "").strip()
-            or str(item.get("cover_url") or item.get("Cover URL") or "").strip()
-        )
-        if has_cover:
-            continue
-
-        attempted += 1
-        if recover_digest_cover_from_source_message(item, chat_id, thread_id):
-            recovered += 1
-        else:
-            still_missing.append(item.get("row") or item.get("Row"))
-
-    result = {
-        "attempted": attempted,
-        "recovered": recovered,
-        "still_missing_rows": still_missing,
-    }
-    print("DIGEST COVER RECOVERY RESULT:", result, flush=True)
-    return result
-
-
-def _digest_placeholder_image() -> Image.Image:
-    return Image.new("RGB", (720, 720), (28, 28, 28))
-
-
-def _apply_frame_to_image(base: Image.Image, genre: str) -> Image.Image:
-    result = base.convert("RGBA")
-    frame_path = resolve_frame_path(genre)
-    if frame_path:
-        with Image.open(frame_path) as frame_source:
-            frame = _prepare_genre_frame(frame_source, result.size)
-            result = Image.alpha_composite(result, frame)
-    elif genre in GENRE_FRAME_FILES:
-        raise RuntimeError(f"Не найдена рамка для жанра {genre}: {GENRE_FRAME_FILES.get(genre)}")
-    return result
-
-
-def _is_rock_digest_genre(genre: str) -> bool:
-    """Rock-only digest switch. Other genres keep the existing 5-cover layout."""
-    normalized = str(genre or "").strip().casefold().replace("ё", "е")
-    return normalized in {
-        "rock",
-        "рок",
-        "chto_music_rock",
-        "@chto_music_rock",
+    if (mediaGroupId && existingMediaGroupId === mediaGroupId) {
+      return { status: "duplicate_media_group_skipped", row: i + 1 };
     }
 
-
-def _paste_rock_digest_grid(canvas: Image.Image, covers: List[Image.Image]) -> None:
-    """
-    Rock digest: 9 equal covers in a clean 3x3 grid.
-    The existing rock frame is applied after the grid.
-    """
-    canvas_size = 1280
-    bounds = [round(i * canvas_size / 3) for i in range(4)]
-
-    for index, image in enumerate(covers[:9]):
-        row = index // 3
-        col = index % 3
-        x0, x1 = bounds[col], bounds[col + 1]
-        y0, y1 = bounds[row], bounds[row + 1]
-
-        fitted = ImageOps.fit(
-            image,
-            (x1 - x0, y1 - y0),
-            method=Image.Resampling.LANCZOS,
-        )
-        canvas.paste(fitted, (x0, y0))
-
-
-def prepare_digest_collage(items: List[dict], genre: str) -> str:
-    paths = []
-    covers = []
-
-    is_rock = _is_rock_digest_genre(genre)
-    required_covers = 9 if is_rock else 5
-
-    try:
-        for item in (items or [])[:required_covers]:
-            try:
-                path = _digest_cover_source(item)
-                if path:
-                    paths.append(path)
-                    with Image.open(path) as source:
-                        covers.append(source.convert("RGB").copy())
-                else:
-                    covers.append(_digest_placeholder_image())
-            except Exception as e:
-                print(
-                    "DIGEST COVER ERROR:",
-                    {"item": item.get("row"), "error": str(e)},
-                    flush=True,
-                )
-                covers.append(_digest_placeholder_image())
-
-        while len(covers) < required_covers:
-            covers.append(_digest_placeholder_image())
-
-        canvas = Image.new("RGB", (1280, 1280), (20, 20, 20))
-
-        if is_rock:
-            # ROCK ONLY: 9 covers, equal 3x3 grid.
-            _paste_rock_digest_grid(canvas, covers)
-            print(
-                "DIGEST COLLAGE LAYOUT:",
-                {"genre": genre, "layout": "3x3", "covers": 9},
-                flush=True,
-            )
-        else:
-            # ALL OTHER GENRES: preserve the previous 5-cover composition.
-            for image, pos in zip(
-                covers[:4],
-                [(0, 0), (580, 0), (0, 580), (580, 580)],
-            ):
-                canvas.paste(
-                    ImageOps.fit(
-                        image,
-                        (700, 700),
-                        method=Image.Resampling.LANCZOS,
-                    ),
-                    pos,
-                )
-
-            center = ImageOps.fit(
-                covers[4],
-                (650, 650),
-                method=Image.Resampling.LANCZOS,
-            )
-            center = ImageOps.expand(
-                center,
-                border=10,
-                fill=(245, 245, 245),
-            )
-            canvas.paste(
-                center,
-                (
-                    (1280 - center.width) // 2,
-                    (1280 - center.height) // 2,
-                ),
-            )
-            print(
-                "DIGEST COLLAGE LAYOUT:",
-                {"genre": genre, "layout": "legacy_5", "covers": 5},
-                flush=True,
-            )
-
-        # Existing genre-frame logic remains unchanged.
-        final_image = _apply_frame_to_image(canvas, genre)
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        tmp.close()
-        final_image.save(tmp.name, "PNG", optimize=True)
-        return tmp.name
-
-    finally:
-        for path in paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
-def send_ready_digest(digest: dict):
-    chat_id = digest.get("chat_id") or digest.get("Chat ID")
-    thread_id = digest.get("thread_id") or digest.get("Thread ID")
-    rows = digest.get("rows") or []
-    genre = digest.get("genre") or digest.get("Genre") or ""
-    items = digest.get("items") or []
-    if not chat_id:
-        print("DIGEST SKIP: no chat_id", digest, flush=True)
-        return
-
-    # Recover old missing covers before building the collage.
-    recovery_result = recover_missing_digest_covers(digest)
-
-    collage_path = ""
-    try:
-        collage_path = prepare_digest_collage(items, genre)
-        result = _send_draft_photo(chat_id, int(thread_id) if str(thread_id).isdigit() else thread_id, collage_path, build_digest_text(digest), genre)
-        message_id = result.get("message_id")
-        digest_link = build_telegram_message_link(chat_id, message_id) or "digest_sent"
-        mark_result = sheets_post_action("mark_digest_done", {"rows": ",".join([str(r) for r in rows]), "found_in": digest_link})
-        print(
-            "DIGEST COLLAGE SENT:",
-            {
-                "genre": genre,
-                "chat_id": chat_id,
-                "thread_id": thread_id,
-                "rows": rows,
-                "message_id": message_id,
-                "digest_link": digest_link,
-                "cover_recovery": recovery_result,
-                "mark_result": mark_result,
-            },
-            flush=True,
-        )
-    finally:
-        if collage_path:
-            try:
-                os.remove(collage_path)
-            except OSError:
-                pass
-
-
-
-def run_digest_check_once():
-    if not DIGEST_ENGINE_ENABLED:
-        return
-
-    try:
-        result = sheets_get("get_ready_digests", {"size": str(DIGEST_SIZE)})
-        print("DIGEST CHECK RESULT:", result, flush=True)
-
-        digests = result.get("digests") or []
-        for digest in digests:
-            try:
-                send_ready_digest(digest)
-            except Exception as e:
-                print("DIGEST SEND ERROR:", str(e), digest, flush=True)
-
-    except Exception as e:
-        print("DIGEST CHECK ERROR:", str(e), flush=True)
-
-
-def run_review_check_once():
-    if not REVIEW_ENGINE_ENABLED:
-        return
-
-    try:
-        result = sheets_get("check_reviews")
-        print("REVIEW CHECK RESULT:", result, flush=True)
-
-        reminders = result.get("reminders") or []
-        for reminder in reminders:
-            try:
-                send_review_reminder(reminder)
-            except Exception as e:
-                print("REVIEW REMINDER ERROR:", str(e), reminder, flush=True)
-
-    except Exception as e:
-        print("REVIEW CHECK ERROR:", str(e), flush=True)
-
-
-def build_monthly_stats_text(report: dict) -> str:
-    month_name = str(report.get("month_name") or report.get("month") or "").strip()
-    year = str(report.get("year") or "").strip()
-    total = int(report.get("total") or 0)
-
-    title = f"📊 <b>Итоги редакции — {html_escape(month_name)}"
-    if year:
-        title += f" {html_escape(year)}"
-    title += "</b>"
-
-    lines = [title, "", f"Всего постов: <b>{total}</b>", "", "<b>По каналам:</b>"]
-
-    channels = report.get("channels") or []
-    if channels:
-        for item in channels:
-            label = str(item.get("label") or item.get("channel") or "Без канала")
-            count = int(item.get("count") or 0)
-            lines.append(f"• {html_escape(label)} — <b>{count}</b>")
-    else:
-        lines.append("• нет данных")
-
-    lines.extend(["", "<b>По авторам:</b>"])
-    authors = report.get("authors") or []
-    if authors:
-        for item in authors:
-            author = str(item.get("author") or "Без автора")
-            count = int(item.get("count") or 0)
-            lines.append(f"• {html_escape(author)} — <b>{count}</b>")
-    else:
-        lines.append("• нет данных")
-
-    return "\n".join(lines)[:4090]
-
-
-def send_monthly_stats_report(report: dict) -> dict:
-    if not MONTHLY_STATS_CHAT_ID:
-        raise RuntimeError("MONTHLY_STATS_CHAT_ID is empty")
-
-    payload = {
-        "chat_id": str(MONTHLY_STATS_CHAT_ID),
-        "text": build_monthly_stats_text(report),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+    if (
+      existingTitle === title &&
+      existingChannel === channel &&
+      String(existingDate) === formattedDate
+    ) {
+      return { status: "duplicate_text_date_skipped", row: i + 1 };
     }
-    if MONTHLY_STATS_THREAD_ID:
-        payload["message_thread_id"] = str(MONTHLY_STATS_THREAD_ID)
 
-    # Monthly reports are intentionally not added to the cleanup queue.
-    return telegram_api_json("sendMessage", payload)
+    if (existingLink === link && link) {
+      return { status: "duplicate_link_skipped", row: i + 1 };
+    }
+  }
 
-
-def run_monthly_stats_check_once():
-    if not MONTHLY_STATS_ENABLED:
-        return
-    if not MONTHLY_STATS_CHAT_ID:
-        print("MONTHLY STATS SKIP: no chat id", flush=True)
-        return
-
-    try:
-        result = sheets_get("get_monthly_stats", {"mode": "unsent"})
-        reports = result.get("reports") or []
-        print(
-            "MONTHLY STATS CHECK RESULT:",
-            {
-                "status": result.get("status"),
-                "script_version": result.get("script_version"),
-                "reports_count": len(reports),
-                "available_completed_months": result.get("available_completed_months"),
-            },
-            flush=True,
-        )
-
-        for report in reports:
-            month_key = str(report.get("key") or "").strip()
-            if not month_key:
-                continue
-            try:
-                sent = send_monthly_stats_report(report)
-                mark_result = sheets_post_action(
-                    "mark_monthly_stats_sent",
-                    {
-                        "month_key": month_key,
-                        "telegram_message_id": str(sent.get("message_id") or ""),
-                    },
-                )
-                print(
-                    "MONTHLY STATS SENT:",
-                    {
-                        "month_key": month_key,
-                        "total": report.get("total"),
-                        "message_id": sent.get("message_id"),
-                        "mark_result": mark_result,
-                    },
-                    flush=True,
-                )
-                time.sleep(0.25)
-            except Exception as e:
-                print("MONTHLY STATS SEND ERROR:", {"month_key": month_key, "error": str(e)}, flush=True)
-                break
-    except Exception as e:
-        print("MONTHLY STATS CHECK ERROR:", str(e), flush=True)
+  return null;
+}
 
 
+function isDuplicate(sheet, data, formattedDate) {
+  var info = findDuplicateInfo(sheet, data, formattedDate);
+  return info ? info.status : "";
+}
 
-def review_scheduler_loop():
-    print("REVIEW SCHEDULER STARTED", {"interval_sec": REVIEW_CHECK_INTERVAL_SEC}, flush=True)
+function normalizeTelegramChannelName(value) {
+  value = String(value || "").trim().toLowerCase();
+  if (!value) return "";
 
-    # First check shortly after boot, then by interval.
-    time.sleep(20)
+  value = value.replace(/^https?:\/\/(www\.)?t\.me\//, "");
+  value = value.replace(/^t\.me\//, "");
+  value = value.replace(/^@/, "");
+  value = value.split(/[\/?#]/)[0];
 
-    while True:
-        run_review_check_once()
-        run_digest_check_once()
-        run_monthly_stats_check_once()
-        time.sleep(REVIEW_CHECK_INTERVAL_SEC)
-
-
-def start_review_scheduler():
-    global review_scheduler_started
-
-    if not REVIEW_ENGINE_ENABLED and not DIGEST_ENGINE_ENABLED and not MONTHLY_STATS_ENABLED:
-        print("REVIEW/DIGEST/MONTHLY STATS ENGINES DISABLED", flush=True)
-        return
-
-    with review_scheduler_lock:
-        if review_scheduler_started:
-            return
-
-        t = threading.Thread(target=review_scheduler_loop, daemon=True)
-        t.start()
-        review_scheduler_started = True
+  return value.trim();
+}
 
 
-def callback_message_context(callback: dict) -> dict:
-    message = callback.get("message") or {}
-    chat = message.get("chat") or {}
+function expectedChannelForGenre(genre) {
+  var key = String(genre || "").trim().toLowerCase();
+  return normalizeTelegramChannelName(EXPECTED_CHANNEL_BY_GENRE[key] || "");
+}
+
+
+function buildPublicationLinkIndex(values, headerMap, sheet) {
+  var index = {};
+  var repairedTelegramLinks = 0;
+  var missingTelegramLinks = 0;
+  var yandexIndexed = 0;
+  var commonIndexed = 0;
+
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+
+    // Real content sheet:
+    // B = Channel, C = Date, D = Telegram post Link, J = Status.
+    var rawStatus = row.length > 9 ? row[9] : "";
+    var statusValue = String(rawStatus || getValue(row, headerMap, "Status") || "")
+      .replace(/\u00A0/g, " ")
+      .trim()
+      .toLowerCase();
+
+    // Only real final publication rows may prove that a review was published.
+    if (
+      !/^(done|published)(?:\b|$)/i.test(statusValue) &&
+      !/^(готово|опубликовано)(?:\b|$)/i.test(statusValue)
+    ) {
+      continue;
+    }
+
+    var postLink = String(getValue(row, headerMap, "Link") || "").trim();
+    var channel = normalizeTelegramChannelName(
+      getValue(row, headerMap, "Channel") || (row.length > 1 ? row[1] : "") || ""
+    );
+
+    if (!channel) {
+      continue;
+    }
+
+    // Some historical content rows have the publication itself, release links,
+    // channel and message_id, but column D (Telegram post link) is blank.
+    // Reconstruct it from Channel + message_id and repair the sheet in-place.
+    var messageId = String(
+      getValue(row, headerMap, "message_id") ||
+      getValue(row, headerMap, "Message ID") ||
+      (row.length > 5 ? row[5] : "") ||
+      ""
+    ).trim();
+
+    if (!/^https?:\/\/t\.me\//i.test(postLink) && channel && messageId) {
+      postLink = "https://t.me/" + channel + "/" + messageId;
+
+      try {
+        if (sheet) {
+          if (headerMap["Link"] !== undefined) {
+            sheet.getRange(i + 1, headerMap["Link"] + 1).setValue(postLink);
+          } else {
+            // Legacy layout: Link is column D.
+            sheet.getRange(i + 1, 4).setValue(postLink);
+          }
+        }
+        repairedTelegramLinks++;
+      } catch (repairErr) {
+        // A failed backfill must not stop publication matching.
+      }
+    }
+
+    if (!/^https?:\/\/t\.me\//i.test(postLink)) {
+      missingTelegramLinks++;
+    }
+
+    // IMPORTANT V32:
+    // Missing Telegram post link is NOT a reason to ignore an otherwise valid
+    // published content row. Exact release-link match + correct genre channel
+    // + done/published status is sufficient proof of publication.
+    var publishedRawText = String(
+      getValue(row, headerMap, "Title") ||
+      (row.length ? row[0] : "") ||
+      ""
+    ).trim();
+    var publishedDisplayTitle = buildPendingDisplayTitle(publishedRawText);
+    var publishedTitleKey = normalizePublicationTitleKey(publishedDisplayTitle);
+
+    var typedLinks = getTypedReleaseLinks(row, headerMap, "content");
+
+    for (var j = 0; j < typedLinks.length; j++) {
+      var item = typedLinks[j];
+      var key = item.kind + "|" + item.url;
+
+      if (item.kind === "yandex") yandexIndexed++;
+      if (item.kind === "common") commonIndexed++;
+
+      if (!index[key]) index[key] = [];
+
+      index[key].push({
+        row: i + 1,
+        post_link: postLink,
+        matched_link: item.url,
+        link_kind: item.kind,
+        channel: channel,
+        display_title: publishedDisplayTitle,
+        title_key: publishedTitleKey
+      });
+    }
+  }
+
+  index.__meta = {
+    repaired_telegram_links: repairedTelegramLinks,
+    missing_telegram_links: missingTelegramLinks,
+    yandex_indexed: yandexIndexed,
+    common_indexed: commonIndexed
+  };
+
+  return index;
+}
+
+
+function isPuzzleBotGarbageUrl(url) {
+  var s = String(url || "").trim().toLowerCase();
+  if (!s) return false;
+
+  return (
+    s.indexOf("puzzlebot.top") !== -1 ||
+    s.indexOf("[[") !== -1 ||
+    s.indexOf("]]") !== -1 ||
+    s.indexOf("%5b%5b") !== -1 ||
+    s.indexOf("%5d%5d") !== -1 ||
+    s.indexOf("{{") !== -1 ||
+    s.indexOf("}}") !== -1
+  );
+}
+
+
+function extractUrlsFromCell(value) {
+  if (!value) return [];
+
+  var raw = String(value || "");
+  var matches = raw.match(/https?:\/\/[^\s<>"'()]+/gi) || [];
+  var result = [];
+  var seen = {};
+
+  for (var i = 0; i < matches.length; i++) {
+    var url = String(matches[i] || "")
+      .replace(/[.,;:!?]+$/g, "")
+      .trim();
+
+    if (!url || seen[url]) continue;
+    seen[url] = true;
+    result.push(url);
+  }
+
+  return result;
+}
+
+
+function getTypedReleaseLinks(row, headerMap, sheetKind) {
+  var result = [];
+  var seen = {};
+
+  function add(kind, rawValue) {
+    var urls = extractUrlsFromCell(rawValue);
+
+    for (var i = 0; i < urls.length; i++) {
+      var clean = normalizeUrl(urls[i]);
+      if (!clean) continue;
+
+      // The only garbage we exclude is PuzzleBot/template URL.
+      if (kind === "common" && isPuzzleBotGarbageUrl(clean)) continue;
+
+      var key = kind + "|" + clean;
+      if (seen[key]) continue;
+
+      seen[key] = true;
+      result.push({
+        kind: kind,
+        url: clean
+      });
+    }
+  }
+
+  // 1) Read by header, as V32 did.
+  add("yandex", getValue(row, headerMap, "Yandex Link"));
+  add("common", getValue(row, headerMap, "Common Link"));
+
+  // 2) ALSO read the known physical production columns.
+  // This is a merge, not a fallback.
+  //
+  // Предложка:
+  // N = Yandex Link (zero-based 13)
+  // O = Common Link (zero-based 14)
+  //
+  // Таблица контента редакции:
+  // K = Yandex Link (zero-based 10)
+  // L = Common Link (zero-based 11)
+  if (sheetKind === "predlozhka") {
+    if (row.length > 13) add("yandex", row[13]);
+    if (row.length > 14) add("common", row[14]);
+  }
+
+  if (sheetKind === "content") {
+    if (row.length > 10) add("yandex", row[10]);
+    if (row.length > 11) add("common", row[11]);
+  }
+
+  return result;
+}
+
+
+// Compatibility helper used elsewhere in the script.
+function getReviewLinks(row, headerMap) {
+  return getTypedReleaseLinks(row, headerMap, "").map(function(item) {
+    return item.url;
+  });
+}
+
+
+function normalizePublicationTitleKey(value) {
+  var s = String(value || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/^[💿•·▪▫◦\s]+/u, "")
+    .replace(/[—–]/g, "-")
+    .replace(/\s*-\s*/g, " - ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  if (!s || s === "публикация") return "";
+  if (!/^.{1,120}\s-\s.{1,140}$/u.test(s)) return "";
+
+  return s;
+}
+
+
+function findPublication(reviewTypedLinks, publicationIndex, genre, reviewDate, reviewDisplayTitle) {
+  var expectedChannel = expectedChannelForGenre(genre);
+
+  // SIMPLE RULE:
+  // exact normalized Yandex OR exact normalized Common in ANY published
+  // editorial content row means the review is published.
+  //
+  // Genre is used only to choose a useful Telegram "Found In" link.
+  // It is NEVER allowed to block publication status.
+  //
+  // If several content rows contain the same exact release URL, we still
+  // mark the review done, but we do NOT choose a random Telegram post.
+  // In that ambiguous case Found In = the matched release URL itself.
+
+  for (var i = 0; i < reviewTypedLinks.length; i++) {
+    var reviewItem = reviewTypedLinks[i] || {};
+    var kind = String(reviewItem.kind || "");
+    var url = String(reviewItem.url || "");
+
+    if ((kind !== "yandex" && kind !== "common") || !url) continue;
+
+    var candidates = publicationIndex[kind + "|" + url] || [];
+    if (!Array.isArray(candidates)) candidates = [candidates];
+
+    var unique = [];
+    var seenRows = {};
+
+    for (var j = 0; j < candidates.length; j++) {
+      var candidate = candidates[j] || {};
+      if (!candidate.row) continue;
+
+      var rowKey = String(candidate.row) + "|" + String(candidate.post_link || "");
+      if (seenRows[rowKey]) continue;
+
+      seenRows[rowKey] = true;
+      unique.push(candidate);
+    }
+
+    if (!unique.length) continue;
+
+    // Prefer the original genre only for Found In.
+    if (expectedChannel) {
+      var sameGenre = [];
+
+      for (var k = 0; k < unique.length; k++) {
+        var candidateChannel = normalizeTelegramChannelName(unique[k].channel || "");
+        if (candidateChannel === expectedChannel) {
+          sameGenre.push(unique[k]);
+        }
+      }
+
+      if (sameGenre.length === 1) {
+        sameGenre[0].match_method =
+          kind === "yandex" ? "yandex_exact" : "common_exact";
+        sameGenre[0].cross_genre = false;
+        sameGenre[0].ambiguous_publication = false;
+        return sameGenre[0];
+      }
+
+      if (sameGenre.length > 1) {
+        return {
+          row: "",
+          post_link: "",
+          matched_link: url,
+          link_kind: kind,
+          channel: expectedChannel,
+          match_method: kind === "yandex" ? "yandex_exact" : "common_exact",
+          cross_genre: false,
+          ambiguous_publication: true
+        };
+      }
+    }
+
+    // No same-genre candidate. Cross-genre publication is still publication.
+    if (unique.length === 1) {
+      unique[0].match_method =
+        kind === "yandex" ? "yandex_exact_cross_genre" : "common_exact_cross_genre";
+      unique[0].cross_genre = true;
+      unique[0].ambiguous_publication = false;
+      return unique[0];
+    }
+
+    // Several exact candidates in other channels:
+    // status=done, but never write a random Telegram post URL.
     return {
-        "chat_id": chat.get("id"),
-        "thread_id": message.get("message_thread_id"),
+      row: "",
+      post_link: "",
+      matched_link: url,
+      link_kind: kind,
+      channel: "",
+      match_method:
+        kind === "yandex" ? "yandex_exact_cross_genre" : "common_exact_cross_genre",
+      cross_genre: true,
+      ambiguous_publication: true
+    };
+  }
+
+  return null;
+}
+
+
+function splitLinks(value) {
+  if (!value) return [];
+
+  return String(value)
+    .split(/\s+/)
+    .map(function(x) { return String(x || "").trim(); })
+    .filter(function(x) { return x; });
+}
+
+
+function normalizeUrl(url) {
+  if (!url) return "";
+
+  var raw = String(url || "").trim();
+  if (!raw) return "";
+
+  // Google Apps Script V8 does NOT provide the browser Web API URL /
+  // URLSearchParams globals. Parse the small subset we need using strings/regex.
+  if (/^www\./i.test(raw)) {
+    raw = "https://" + raw;
+  }
+
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    raw = "https://" + raw;
+  }
+
+  // Remove fragment first.
+  var hashPos = raw.indexOf("#");
+  if (hashPos !== -1) {
+    raw = raw.slice(0, hashPos);
+  }
+
+  var match = raw.match(/^https?:\/\/([^\/?#]+)([^?#]*)(?:\?([^#]*))?$/i);
+  if (!match) {
+    return raw;
+  }
+
+  var host = String(match[1] || "")
+    .toLowerCase()
+    .replace(/^www\./, "");
+
+  var path = String(match[2] || "");
+  var query = String(match[3] || "");
+
+  path = path.replace(/\/{2,}/g, "/");
+
+  if (!path) path = "/";
+  if (path.length > 1 && path.slice(-1) === "/") {
+    path = path.slice(0, -1);
+  }
+
+  // Yandex Music release identity is host + path.
+  // Any ?ref_id / tracking query is ignored completely.
+  if (
+    host === "music.yandex.ru" ||
+    host === "music.yandex.com" ||
+    host === "music.yandex.kz" ||
+    host === "music.yandex.by"
+  ) {
+    return "https://" + host + path;
+  }
+
+  // For generic Common links remove only known tracking parameters.
+  if (query) {
+    var kept = [];
+    var parts = query.split("&");
+
+    for (var i = 0; i < parts.length; i++) {
+      var part = String(parts[i] || "");
+      if (!part) continue;
+
+      var eq = part.indexOf("=");
+      var rawKey = eq === -1 ? part : part.slice(0, eq);
+      var key = rawKey;
+
+      try {
+        key = decodeURIComponent(rawKey.replace(/\+/g, " "));
+      } catch (decodeErr) {}
+
+      key = String(key || "").toLowerCase();
+
+      var isTracking =
+        key.indexOf("utm_") === 0 ||
+        key.indexOf("ref_") === 0 ||
+        key === "ref" ||
+        key === "fbclid" ||
+        key === "gclid" ||
+        key === "yclid" ||
+        key === "ysclid" ||
+        key === "si" ||
+        key === "feature";
+
+      if (!isTracking) {
+        kept.push(part);
+      }
     }
 
+    query = kept.join("&");
+  }
 
-def send_review_card(row_number, context: Optional[dict] = None):
-    review = sheets_get("get_review", {"row": str(row_number)})
-
-    if review.get("error"):
-        text = f"Не смог найти обзор в таблице: {review.get('error')}"
-    else:
-        text_parts = [
-            "👀 Обзор из Предложки",
-            "",
-            review.get("title") or "",
-        ]
-
-        if review.get("link"):
-            text_parts.append("")
-            text_parts.append(f"Исходный пост: {review.get('link')}")
-
-        if review.get("yandex_link"):
-            text_parts.append(f"Яндекс: {review.get('yandex_link')}")
-
-        if review.get("common_link"):
-            text_parts.append(f"Общая ссылка: {review.get('common_link')}")
-
-        text = "\n".join([p for p in text_parts if p is not None])[:3900]
-
-    if not context:
-        return
-
-    chat_id = context.get("chat_id")
-    if not chat_id:
-        return
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True,
-    }
-
-    thread_id = context.get("thread_id")
-    if thread_id:
-        try:
-            payload["message_thread_id"] = int(thread_id)
-        except Exception:
-            pass
-
-    result = telegram_api_json("sendMessage", payload)
-    _schedule_result_cleanup(result)
+  // HTTP and HTTPS are intentionally treated as the same release identity.
+  return "https://" + host + path + (query ? "?" + query : "");
+}
 
 
-def handle_review_callback(callback: dict):
-    data = callback.get("data") or ""
-    callback_id = callback.get("id")
-    user = callback.get("from") or {}
-    username = user.get("username") or user.get("first_name") or str(user.get("id") or "unknown")
-    context = callback_message_context(callback)
+function parseSheetDate(value) {
+  if (!value) return null;
 
-    if data.startswith("review_done:"):
-        row_number = data.split(":", 1)[1]
-        result = sheets_post_action("mark_review_done", {
-            "row": row_number,
-            "found_in": f"manual:{username}",
-        })
+  if (Object.prototype.toString.call(value) === "[object Date]" && !isNaN(value.getTime())) {
+    return value;
+  }
 
-        telegram_api("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": "Отметил: обзор есть на канале",
-            "show_alert": False,
-        })
+  var s = String(value).trim();
 
-        if context.get("chat_id"):
-            payload = {
-                "chat_id": context.get("chat_id"),
-                "text": f"✅ Отметил обзор как опубликованный вручную. Строка: {row_number}",
-            }
-            if context.get("thread_id"):
-                try:
-                    payload["message_thread_id"] = int(context.get("thread_id"))
-                except Exception:
-                    pass
-            sent = telegram_api_json("sendMessage", payload)
-            _schedule_result_cleanup(sent)
+  var match = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
 
-        print("REVIEW MANUAL DONE:", {"row": row_number, "user": username, "result": result}, flush=True)
-        return True
+  if (match) {
+    return new Date(
+      Number(match[1]),
+      Number(match[2]) - 1,
+      Number(match[3]),
+      Number(match[4]),
+      Number(match[5]),
+      Number(match[6])
+    );
+  }
 
-    if data.startswith("review_show:"):
-        row_number = data.split(":", 1)[1]
+  var parsed = new Date(s);
 
-        telegram_api("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": "Показываю обзор",
-            "show_alert": False,
-        })
+  if (!isNaN(parsed.getTime())) {
+    return parsed;
+  }
 
-        send_review_card(row_number, context)
-        return True
-
-    return False
+  return null;
+}
 
 
-@app.get("/editorial-copy/<int:row_number>")
-def editorial_copy_page(row_number: int):
-    return Response(
-        "Копирование текста отключено. Используй текст готового черновика прямо в Telegram.",
-        status=410,
-        content_type="text/plain; charset=utf-8",
-    )
-
-
-@app.get("/vk_auth")
-def vk_auth():
-    secret = request.args.get("secret", "")
-
-    if not VK_AUTH_SECRET or secret != VK_AUTH_SECRET:
-        return "Forbidden", 403
-
-    if not VK_APP_ID or not VK_APP_SECRET or not VK_REDIRECT_URI:
-        return "VK OAuth env vars are not configured", 500
-
-    params = {
-        "client_id": VK_APP_ID,
-        "display": "page",
-        "redirect_uri": VK_REDIRECT_URI,
-        "scope": "wall,photos,groups",
-        "response_type": "code",
-        "v": "5.199",
-    }
-
-    url = "https://oauth.vk.com/authorize?" + urlencode(params)
-
-    return (
-        '<a href="{0}">Получить VK user token через Render</a>'
-        '<br><br>'
-        '<b>VK_REDIRECT_URI сейчас:</b><br>'
-        '<code>{1}</code>'
-        '<br><br>'
-        '<b>Ссылка авторизации:</b><br>'
-        '<textarea style="width:100%;height:160px">{0}</textarea>'
-    ).format(url, VK_REDIRECT_URI), 200
-
-
-def handle_vk_callback_code():
-    error = request.args.get("error")
-    error_description = request.args.get("error_description")
-
-    if error:
-        return f"VK OAuth error: {error}<br>{error_description}", 400
-
-    code = request.args.get("code", "")
-
-    if not code:
-        return "ok", 200
-
-    try:
-        resp = requests.get(
-            "https://oauth.vk.com/access_token",
-            params={
-                "client_id": VK_APP_ID,
-                "client_secret": VK_APP_SECRET,
-                "redirect_uri": VK_REDIRECT_URI,
-                "code": code,
-            },
-            timeout=60
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if "access_token" not in data:
-            return f"VK token exchange failed: {data}", 400
-
-        token = data["access_token"]
-        user_id = data.get("user_id", "")
-
-        return (
-            "<h3>VK user token получен</h3>"
-            "<p>Скопируй access_token и вставь его в свой конфиг/Google Sheet вместо старого токена.</p>"
-            f"<p><b>user_id:</b> {user_id}</p>"
-            f"<textarea style='width:100%;height:220px'>{token}</textarea>"
-        ), 200
-
-    except Exception as e:
-        return f"VK callback error: {e}", 500
-
-
-@app.get("/")
-def home():
-    return handle_vk_callback_code()
-
-
-@app.post(f"/{BOT_TOKEN}")
-def telegram_webhook():
-    update = request.get_json(silent=True) or {}
-
-    # Callback buttons for review reminders. Safe for other callbacks.
-    if "callback_query" in update:
-        callback = update.get("callback_query") or {}
-        print(
-            "CALLBACK DEBUG:",
-            {
-                "id": callback.get("id"),
-                "data": callback.get("data"),
-                "from": (callback.get("from") or {}).get("username"),
-            },
-            flush=True
-        )
-        try:
-            if handle_draft_callback(callback):
-                return "ok", 200
-            if handle_pending_callback(callback):
-                return "ok", 200
-            if handle_publish_callback(callback):
-                return "ok", 200
-            if handle_review_callback(callback):
-                return "ok", 200
-        except Exception as e:
-            print("CALLBACK ERROR:", str(e), flush=True)
-            try:
-                telegram_api("answerCallbackQuery", {
-                    "callback_query_id": callback.get("id"),
-                    "text": "Ошибка обработки кнопки",
-                    "show_alert": True,
-                })
-            except Exception:
-                pass
-        return "ok", 200
-
-    # Supergroup/topic messages: used for Predlozhka and collecting thread_id.
-    # This does not affect the existing channel_post -> Sheets -> VK flow.
-    # We process normal and edited messages. Telegram Bot API does not send updates
-    # for messages sent by the same bot, and usually does not deliver other bots' messages.
-    incoming_message = update.get("message") or update.get("edited_message")
-    if incoming_message:
-        try:
-            debug_custom_emoji_entities(incoming_message)
-        except Exception as e:
-            print("CUSTOM EMOJI DEBUG ERROR:", str(e), flush=True)
-
-        try:
-            if handle_emojipack_command(incoming_message):
-                return "ok", 200
-        except Exception as e:
-            print("EMOJI PACK COMMAND ERROR:", str(e), flush=True)
-
-        try:
-            if handle_editorial_menu_command(incoming_message):
-                return "ok", 200
-        except Exception as e:
-            print("EDITORIAL MENU COMMAND ERROR:", str(e), flush=True)
-
-        try:
-            cover_attached = False
-            if (
-                is_allowed_predlozhka_chat(incoming_message)
-                and is_allowed_predlozhka_thread(incoming_message)
-                and is_trusted_predlozhka_sender(incoming_message)
-            ):
-                cover_attached = attach_cover_to_recent_sheet_row(incoming_message)
-            if not cover_attached:
-                send_predlozhka_to_sheets(incoming_message)
-        except Exception as e:
-            print("MESSAGE HANDLER ERROR:", str(e), flush=True)
-
-        try:
-            draft_post = assemble_editorial_draft_post(incoming_message)
-            if should_build_publish_preview(draft_post):
-                send_publish_preview(draft_post)
-        except Exception as e:
-            print("AUTOPUBLISH PREVIEW ERROR:", str(e), flush=True)
-
-    if "channel_post" in update:
-        post = update["channel_post"]
-
-        debug_post_media(post)
-        debug_thread_info(post, "channel_post")
-
-        try:
-            send_to_sheets(post)
-        except Exception as e:
-            print("SHEETS ERROR:", str(e), flush=True)
-
-        try:
-            media_group_id = post.get("media_group_id")
-            if media_group_id:
-                buffer_album_post(post)
-            else:
-                publish_single_post_to_vk(post)
-        except Exception as e:
-            print("VK ERROR:", str(e), flush=True)
-
-    return "ok", 200
-
-
-if __name__ == "__main__":
-    start_review_scheduler()
-    start_cleanup_scheduler()
-    app.run(host="0.0.0.0", port=PORT)
+function formatDate(date) {
+  return Utilities.formatDate(
+    date,
+    Session.getScriptTimeZone(),
+    "yyyy-MM-dd HH:mm:ss"
+  );
+}
