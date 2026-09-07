@@ -155,7 +155,7 @@ GENRE_EMOJI_MAP = {
     "glavred": {"emoji_id": "5332472742916678524", "visible": "💿"},
     "rock": {"emoji_id": "5330416810791559528", "visible": "💿"},
     "pop": {"emoji_id": "5332614176189732263", "visible": "💿"},
-    "folk": {"emoji_id": "5330462307380126280", "visible": "💿"},
+    "folk": {"emoji_id": "5330233686270959313", "visible": "💿"},
     "indie": {"emoji_id": "5330524983837875288", "visible": "💿"},
     "hiphop": {"emoji_id": "5330100967486546882", "visible": "💿"},
     "electronica": {"emoji_id": "5332493801141328118", "visible": "💿"},
