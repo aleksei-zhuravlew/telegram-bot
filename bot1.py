@@ -65,7 +65,7 @@ DIGEST_ENGINE_ENABLED = os.environ.get(
 ) == "1"
 DIGEST_SIZE = int(os.environ.get("DIGEST_SIZE", "5"))
 
-MONTHLY_STATS_ENABLED = os.environ.get("MONTHLY_STATS_ENABLED", "1") == "1"
+MONTHLY_STATS_ENABLED = os.environ.get("MONTHLY_STATS_ENABLED", "0") == "1"
 MONTHLY_STATS_CHAT_ID = os.environ.get("MONTHLY_STATS_CHAT_ID", "-1003533638771").strip()
 MONTHLY_STATS_THREAD_ID = os.environ.get("MONTHLY_STATS_THREAD_ID", "").strip()
 
@@ -155,7 +155,7 @@ GENRE_EMOJI_MAP = {
     "glavred": {"emoji_id": "5332472742916678524", "visible": "💿"},
     "rock": {"emoji_id": "5330416810791559528", "visible": "💿"},
     "pop": {"emoji_id": "5332614176189732263", "visible": "💿"},
-    "folk": {"emoji_id": "5330233686270959313", "visible": "💿"},
+    "folk": {"emoji_id": "5330462307380126280", "visible": "💿"},
     "indie": {"emoji_id": "5330524983837875288", "visible": "💿"},
     "hiphop": {"emoji_id": "5330100967486546882", "visible": "💿"},
     "electronica": {"emoji_id": "5332493801141328118", "visible": "💿"},
@@ -2851,6 +2851,25 @@ def send_publish_preview(post: dict):
             {"genre": genre, "draft_message_id": result.get("message_id"), "source_message_id": post.get("message_id")},
             flush=True,
         )
+
+        # A completed draft must not remain in the topic cache.
+        # Otherwise the next review in the same forum topic can inherit old text/cover
+        # and briefly produce a wrong preview before the correct pair arrives.
+        try:
+            completed_key = _draft_parts_key(post)
+            with editorial_draft_parts_lock:
+                removed = editorial_draft_parts.pop(completed_key, None)
+            print(
+                "EDITORIAL DRAFT CACHE CLEARED:",
+                {
+                    "key": completed_key,
+                    "sheet_row": post.get("_editorial_sheet_row"),
+                    "had_cached_entry": bool(removed),
+                },
+                flush=True,
+            )
+        except Exception as cache_error:
+            print("EDITORIAL DRAFT CACHE CLEAR ERROR:", str(cache_error), flush=True)
     finally:
         for path in (source_path, prepared_path):
             if path:
